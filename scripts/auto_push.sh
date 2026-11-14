@@ -73,6 +73,13 @@ if [ ! -f "$DIAG" ]; then
     echo "ssh ${SSH_BASE:-<empty>}"
   } > "$DIAG" 2>&1 || true
 fi
+    echo "--- ssh 版本/路径 ---"
+    ssh -V 2>&1 | head -1
+    which ssh 2>&1
+    echo "--- GIT_SSH_COMMAND 展开后 ---"
+    echo "ssh ${SSH_BASE:-<empty>}"
+  } > "$DIAG" 2>&1 || true
+fi
 
 
 # ---- 诊断信息（首次失败时记录，便于定位环境差异）----
