@@ -23,7 +23,8 @@
 - 代理 `127.0.0.1:64796` 不可用 → `curl --noproxy '*'`；cargo 必须同时 `no_proxy=*`。
 - **一律用 `--release` 跑测试**（debug 版 cargo test 产物在本机被拒执行，WinError 5）。
 - **`CARGO_TARGET_DIR` 必须指向系统临时目录**（工作区内 .exe 会被回收）。
-- 工具链：Rust 1.100 windows-gnu 宿主 + 预装 MinGW `D:\mingw64x2`；无 MSVC/新 SDK。
+- 工具链：Rust 1.100 windows-gnu 宿主 + MinGW `D:\mingw64x2`（GCC 15.2.0，脚本钉住）；无 MSVC/新 SDK。
+- **两套 MinGW 并存**（`D:\mingw64x2` 15.2.0 + WinGet WinLibs 16.2.0）：PATH 顺序不可漂移，改动后必须重跑回归。
 - crates 走 rsproxy 稀疏索引（`~/.cargo/config.toml` 已配置）。
 
 ## 现状（2026-11-14）
