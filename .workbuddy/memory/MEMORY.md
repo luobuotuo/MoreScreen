@@ -29,11 +29,16 @@
 
 ## 现状（2026-11-14）
 Stage 0 ✅ / Stage 1 ✅（枚举 24~35 个显示目标，虚拟屏判定可靠）/ Stage 2 ✅（物理主屏实测 60.1fps、首帧 14ms、1920×1080）
-/ Stage 3a ✅（GPU 回读 + 亮度自检 240.8/99.5% + NV12 导出 3,110,400B，肉眼可读）。
+/ Stage 3a ✅（GPU 回读 + 亮度自检 240.8/99.5% + NV12 导出 3,110,400B，肉眼可读）
+/ Stage 3 ✅（H.264 编码：Constrained Baseline yuv420p 1920×1080；访问单元 [SPS,PPS,IDR] 独立解码 6,220,800B 正确）
+/ Stage 4 ⚠️传输已验证（WS 探针收流无损、浏览器端 configure 成功），**但本机 Chromium 视频解码器不可用**
+（H.264 与 VP8 一律 `EncodingError: Decoding error.`；无头模式 frames=0）→ 对照实验证明是环境问题，非码流问题。
 **阻塞点：本机 Parsec/ToDesk/AskLink 虚拟适配器未建会话时不暴露模式 → 已下载静态 VDD(MttVDD 25.7.23)，
-安装需 UAC 提权，等待用户确认；回滚 `pnputil /delete-driver mttvdd.inf /uninstall /force`。**
-未做：H.264 编码(MFT)、WebRTC 传输、端到端延迟测量、macOS/Linux。
-沙箱限制：PowerShell 工具禁止拉起 cmd.exe；提权用 `Start-Process -Verb RunAs` 直接调 pnputil.exe。
+两次 UAC 提权均被拒，驱动未落地；手动命令 `pnputil /add-driver tools\vdd-driver\VirtualDisplayDriver\MttVDD.inf /install`，
+回滚 `pnputil /delete-driver mttvdd.inf /uninstall /force`。**
+未做：MF 自研编码器（现用 ffmpeg 子进程，接口已留）、WebRTC、端到端延迟测量、macOS/Linux、键鼠回传。
+工具源：静态 ffmpeg 走 PyPI 镜像（imageio-ffmpeg）最可靠；winget/gyan/GitHub 直连在本机慢或失败。
+沙箱限制：PowerShell 工具禁止拉起 cmd.exe；提权用 `Start-Process -Verb RunAs` 直接调 pnputil.exe（可能需用户点 UAC）。
 
 ## 参考实现要点（Deskreen CE）
 Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传输 simple-peer/WebRTC；
