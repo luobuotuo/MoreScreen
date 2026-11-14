@@ -7,7 +7,8 @@
 | 0 固定基线 | 环境/硬件/工具链可复现 | ✅ 完成 | `docs/00-baseline.md` |
 | 1 虚拟屏 | 枚举并绑定虚拟显示器 | ⚠️ 部分 | 能枚举 + 识别虚拟适配器；**本机虚拟适配器未点亮**（模式列表为空） |
 | 2 指定屏采集 | WGC + D3D11 抓指定屏 | ✅ 完成（物理屏） | 5s / 300 帧 / 60.1fps / 首帧 14.1ms / 1920×1080 |
-| 3 本地编码 | H.264 硬编并落盘 | ⬜ 未开始 | — |
+| 2b 内容自检 | GPU 回读 + 亮度判定 + NV12 导出 | ✅ 完成 | 平均亮度 240.8 / 非黑占比 99.5% / NV12 3,110,400 B = 1920×1080×1.5，导出帧肉眼可读 |
+| 3 本地编码 | H.264 硬编并落盘 | ⬜ 未开始 | NV12 输入已就绪，待接 Media Foundation MFT |
 | 4 WebRTC | 局域网传输 + 浏览器解码 | ⬜ 未开始 | 接收端骨架：`web/receiver/index.html` |
 | 5 测量与故障注入 | 分段耗时 + 弱网 + 恢复 | ⬜ 未开始 | 指标写入器已就绪（JSONL） |
 
@@ -26,7 +27,7 @@ web/receiver/       浏览器接收端骨架（Stage 4）
 scripts/env.sh      环境变量（proxy 绕过 + CARGO_TARGET_DIR + PATH）
 ```
 
-## 三、当前唯一阻塞点
+## 三、当前阻塞点（含 UAC 提权）
 
 **本机的三个虚拟显示适配器（Parsec / ToDesk / AskLink）在没有客户端会话时不暴露任何显示模式**，
 所以现在能抓的是物理屏，不是"扩展出来的第二块屏"。三条解法：
@@ -36,6 +37,15 @@ scripts/env.sh      环境变量（proxy 绕过 + CARGO_TARGET_DIR + PATH）
 | A. 安装静态 VDD（Virtual Display Driver / IddCx，MIT） | 需要管理员权限安装驱动 | ✅ 推荐用于打通链路；注意 GPU 大版本升级前先卸载 |
 | B. 让 ToDesk / Parsec / AskLink 任一客户端建立一次会话 | 无需安装，但依赖第三方软件在线 | 可作临时验证 |
 | C. 自研 IddCx 驱动 | 3～6 个月 + 签名成本 | 产品化阶段再做 |
+
+> **提权安装（方案 A）需要你点一次 UAC**：驱动包已下载到 `tools/vdd-driver/VirtualDisplayDriver/`
+> （`MttVDD.inf` + 签名的 `mttvdd.cat` + `MttVDD.dll`，版本 25.7.23）。
+> 桌面弹窗点"是"即可；若弹窗已消失或你看不到安全桌面，用管理员终端手动执行一行：
+> ```
+> pnputil /add-driver "D://app-workbuddy//01_remote-screen//tools//vdd-driver//VirtualDisplayDriver//MttVDD.inf" /install
+> ```
+> 卸载/回滚：`pnputil /delete-driver mttvdd.inf /uninstall /force`
+> （GPU 大版本升级前务必先卸载，否则可能黑屏。）
 
 > 采集链路本身已验证可用，所以**只要有一块被点亮的虚拟屏，Stage 2→4 就能连续推进**。
 

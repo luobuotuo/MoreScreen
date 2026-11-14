@@ -1,3 +1,4 @@
+
 //! Windows 屏幕采集（Windows.Graphics.Capture / D3D11）。
 //!
 //! 目标：只抓"指定的那一块显示器"，并且从第一帧开始就带时间戳，
@@ -6,11 +7,13 @@
 //! 关键点：
 //! - 每块屏独立 CaptureItem / FramePool / Session，不共享；
 //! - 用 `TryGetNextFrame` 轮询而非事件回调，避免跨线程事件复杂度（首版）；
-//! - 帧面保持在 GPU（D3D11 表面），不做 CPU 回读；
+//! - 帧面保持在 GPU（D3D11 表面），需要像素时才回读；
 //! - 记录 `SystemRelativeTime`（系统时钟）与本地 QPC 两套时间戳。
 
+use std::path::Path;
 use std::time::Instant;
 
+use crate::readback::{analyze_surface, FrameContent};
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
@@ -40,10 +43,14 @@ pub struct CaptureStats {
     pub content_width: u32,
     pub content_height: u32,
     pub min_interval_ms: f64,
+    /// 首帧内容自检（亮度）
+    pub content: Option<FrameContent>,
+    /// 导出的 NV12 帧路径（若请求）
+    pub nv12_path: Option<String>,
 }
 
-/// 创建一个 D3D11 设备，并包装成 WinRT `IDirect3DDevice`（WGC 需要）。
-unsafe fn create_device() -> Result<(ID3D11Device, IDirect3DDevice), String> {
+/// 创建一个 D3D11 设备 + 立即上下文，并包装成 WinRT `IDirect3DDevice`（WGC 需要）。
+unsafe fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), String> {
     let feature_levels = [
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
@@ -66,6 +73,7 @@ unsafe fn create_device() -> Result<(ID3D11Device, IDirect3DDevice), String> {
     )
     .map_err(|e| format!("D3D11CreateDevice 失败: {e}"))?;
     let device = device.ok_or_else(|| "D3D11CreateDevice 未返回设备".to_string())?;
+    let context = context.ok_or_else(|| "D3D11CreateDevice 未返回上下文".to_string())?;
 
     // D3D11 设备 -> DXGI 设备 -> WinRT IDirect3DDevice
     let dxgi_device = device
@@ -76,25 +84,31 @@ unsafe fn create_device() -> Result<(ID3D11Device, IDirect3DDevice), String> {
     let winrt_device = inspectable
         .cast::<IDirect3DDevice>()
         .map_err(|e| format!("转换为 IDirect3DDevice 失败: {e}"))?;
-    Ok((device, winrt_device))
+    Ok((device, context, winrt_device))
 }
 
 /// 按显示区域中心点定位 HMONITOR。
-pub unsafe fn monitor_from_bounds(x: i32, y: i32, width: u32, height: u32) -> windows::Win32::Graphics::Gdi::HMONITOR {
+pub unsafe fn monitor_from_bounds(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> windows::Win32::Graphics::Gdi::HMONITOR {
     let cx = x + (width / 2) as i32;
     let cy = y + (height / 2) as i32;
     MonitorFromPoint(POINT { x: cx, y: cy }, MONITOR_DEFAULTTONEAREST)
 }
 
-/// 对指定显示器做一次采集探测：抓 N 秒，统计帧率与内容尺寸。
+/// 对指定显示器做一次采集探测：抓 N 秒，统计帧率与内容尺寸，并自检首帧亮度。
 ///
-/// 不做像素回读（Stage 2 目标是"能稳定抓到指定屏且时间戳可信"）。
+/// `dump_nv12`：若指定路径，则把首帧转成 NV12 落盘（供编码器输入）。
 pub fn probe_capture(
     bounds_x: i32,
     bounds_y: i32,
     width: u32,
     height: u32,
     duration_ms: u64,
+    dump_nv12: Option<&Path>,
 ) -> Result<CaptureStats, String> {
     unsafe {
         let hmonitor = monitor_from_bounds(bounds_x, bounds_y, width, height);
@@ -102,9 +116,8 @@ pub fn probe_capture(
             return Err("MonitorFromPoint 未返回有效 HMONITOR".into());
         }
 
-        let (_d3d_device, winrt_device) = create_device()?;
+        let (d3d_device, d3d_context, winrt_device) = create_device()?;
 
-        // 通过 interop 为该显示器创建捕获项
         let interop: IGraphicsCaptureItemInterop =
             factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
                 .map_err(|e| format!("获取 IGraphicsCaptureItemInterop 失败: {e}"))?;
@@ -141,7 +154,8 @@ pub fn probe_capture(
                         stats.avg_interval_ms = if stats.frames == 0 {
                             interval
                         } else {
-                            stats.avg_interval_ms + (interval - stats.avg_interval_ms) / (stats.frames as f64)
+                            stats.avg_interval_ms
+                                + (interval - stats.avg_interval_ms) / (stats.frames as f64)
                         };
                         stats.max_interval_ms = stats.max_interval_ms.max(interval);
                         stats.min_interval_ms = if stats.min_interval_ms == 0.0 {
@@ -156,6 +170,26 @@ pub fn probe_capture(
                     stats.frames += 1;
                     if let Ok(content) = frame.ContentSize() {
                         last_content = (content.Width as u32, content.Height as u32);
+                    }
+
+                    // 首帧做一次内容自检（亮度 + 可选导出 NV12）
+                    if stats.content.is_none() {
+                        if let Ok(surface) = frame.Surface() {
+                            let want_nv12 = dump_nv12.is_some();
+                            if let Ok((content, nv12)) =
+                                analyze_surface(&d3d_device, &d3d_context, &surface, 4, want_nv12)
+                            {
+                                stats.content = Some(content);
+                                if let (Some(path), Some(buf)) = (dump_nv12, nv12) {
+                                    if let Some(parent) = path.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    std::fs::write(path, &buf)
+                                        .map_err(|e| format!("写 NV12 失败: {e}"))?;
+                                    stats.nv12_path = Some(path.display().to_string());
+                                }
+                            }
+                        }
                     }
                 }
                 Err(_) => {

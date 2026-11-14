@@ -112,6 +112,51 @@ fn main() {
                 }
             }
         }
+        "capture-dump" => {
+            // 采集 + 导出首帧 NV12（Stage 3 编码器输入）
+            let displays = enumerate_displays();
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let out = arg_value(&args, "--out").unwrap_or_else(|| "out/frame.nv12".to_string());
+            let target = match displays.get(index) {
+                Some(d) => d,
+                None => {
+                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    std::process::exit(2);
+                }
+            };
+            println!("目标: {}", target.label());
+            match remote_screen_host_win::capture::probe_capture(
+                target.bounds.x,
+                target.bounds.y,
+                target.mode.width,
+                target.mode.height,
+                1500,
+                Some(std::path::Path::new(&out)),
+            ) {
+                Ok(s) => {
+                    println!("帧数 = {}", s.frames);
+                    if let Some(c) = &s.content {
+                        println!(
+                            "内容自检 = 平均亮度 {:.1} / 峰值 {} / 非黑占比 {:.1}%（{}）",
+                            c.luma_avg,
+                            c.luma_max,
+                            c.non_black_ratio * 100.0,
+                            if c.is_black { "判定为黑画面" } else { "画面有效" }
+                        );
+                    }
+                    match &s.nv12_path {
+                        Some(p) => println!("NV12 已导出: {}", p),
+                        None => println!("未导出 NV12"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("采集失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "capture-probe" => {
             // 采集探测：抓取指定显示器若干秒，输出帧率与内容尺寸
             let displays = enumerate_displays();
@@ -149,6 +194,7 @@ fn main() {
                 target.mode.width,
                 target.mode.height,
                 seconds * 1000,
+                None,
             ) {
                 Ok(s) => {
                     let fps = if s.avg_interval_ms > 0.0 {
@@ -165,6 +211,15 @@ fn main() {
                     );
                     println!("  最小/最大间隔 = {:.2} / {:.2} ms", s.min_interval_ms, s.max_interval_ms);
                     println!("  内容尺寸      = {}x{}", s.content_width, s.content_height);
+                    if let Some(c) = &s.content {
+                        println!(
+                            "  内容自检      = 平均亮度 {:.1} / 峰值 {} / 非黑占比 {:.1}%（{}）",
+                            c.luma_avg,
+                            c.luma_max,
+                            c.non_black_ratio * 100.0,
+                            if c.is_black { "判定为黑画面" } else { "画面有效" }
+                        );
+                    }
                     if s.frames == 0 {
                         eprintln!("警告: 未捕获到任何帧");
                         std::process::exit(3);
@@ -177,7 +232,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | selftest | capture-probe [--index N] [--seconds S]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--index N] [--seconds S] | capture-dump [--index N] [--out file.nv12]>");
         }
     }
 }

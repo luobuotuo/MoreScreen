@@ -3,3 +3,6 @@ target/
 node_modules/
 *.log
 .DS_Store
+out/
+tools/vdd-driver*
+tools/*.zip
