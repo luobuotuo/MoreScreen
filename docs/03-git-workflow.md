@@ -57,6 +57,33 @@ hook 对策：
 - 最后一次兜底忽略 `known_hosts`（密钥认证仍然生效）；
 - `HOME` 统一规范化为 POSIX 形式（Windows 形式会让 Git Bash 的 OpenSSH 拼出非法路径）。
 
+### 真正的根因：不要用 `GIT_SSH_COMMAND`
+
+现象（仅在 `git commit` 触发的 hook 里出现，手动 `git push` 一切正常）：
+
+```text
+Load key "/c/Users/sz-ws016/.ssh/id_ed25519": Permission denied
+git@github.com: Permission denied (publickey).
+Failed to add the host to the list of known hosts
+```
+
+根因：设置 `GIT_SSH_COMMAND` 后，git 会用 `sh -c "ssh ..."` **再解析一遍**命令行，
+MSYS2 在这一层把 `~/.ssh` 的访问路径改写，ssh 因此读不到私钥与 known_hosts。
+不设 `GIT_SSH_COMMAND` 时，git 使用默认的 ssh 调用方式，路径不被改写，一切正常。
+
+最终 hook 的关键设置：
+
+```sh
+export MSYS2_ARG_CONV_EXCL='*'      # 禁用 MSYS2 参数转换
+export MSYS_NO_PATHCONV=1           # 禁用 MSYS2 路径转换
+export GIT_TERMINAL_PROMPT=0        # 禁止任何交互式提示
+# HOME 规范为 POSIX 形式（/c/Users/...）
+git push --quiet "$remote" "HEAD:refs/heads/$branch"
+```
+
+诊断信息在每次 hook 运行时追加到 `.git/auto-push.diag`，其中对比了
+「hook 内直连 ssh」与「git 内 ssh（ls-remote）」两条路径的差异。
+
 ### 可选：常驻 ssh-agent（更稳，需管理员一次）
 
 把密钥放进常驻 agent 后，ssh 不再直读私钥文件，可彻底绕开文件锁：
@@ -87,6 +114,33 @@ hook 对策：
 - **失败自动重试 5 次、间隔 5 秒**（覆盖约 20 秒的文件锁窗口）；
 - 最后一次兜底忽略 `known_hosts`（密钥认证仍然生效）；
 - `HOME` 统一规范化为 POSIX 形式（Windows 形式会让 Git Bash 的 OpenSSH 拼出非法路径）。
+
+### 真正的根因：不要用 `GIT_SSH_COMMAND`
+
+现象（仅在 `git commit` 触发的 hook 里出现，手动 `git push` 一切正常）：
+
+```text
+Load key "/c/Users/sz-ws016/.ssh/id_ed25519": Permission denied
+git@github.com: Permission denied (publickey).
+Failed to add the host to the list of known hosts
+```
+
+根因：设置 `GIT_SSH_COMMAND` 后，git 会用 `sh -c "ssh ..."` **再解析一遍**命令行，
+MSYS2 在这一层把 `~/.ssh` 的访问路径改写，ssh 因此读不到私钥与 known_hosts。
+不设 `GIT_SSH_COMMAND` 时，git 使用默认的 ssh 调用方式，路径不被改写，一切正常。
+
+最终 hook 的关键设置：
+
+```sh
+export MSYS2_ARG_CONV_EXCL='*'      # 禁用 MSYS2 参数转换
+export MSYS_NO_PATHCONV=1           # 禁用 MSYS2 路径转换
+export GIT_TERMINAL_PROMPT=0        # 禁止任何交互式提示
+# HOME 规范为 POSIX 形式（/c/Users/...）
+git push --quiet "$remote" "HEAD:refs/heads/$branch"
+```
+
+诊断信息在每次 hook 运行时追加到 `.git/auto-push.diag`，其中对比了
+「hook 内直连 ssh」与「git 内 ssh（ls-remote）」两条路径的差异。
 
 ### 可选：常驻 ssh-agent（更稳，需管理员一次）
 
