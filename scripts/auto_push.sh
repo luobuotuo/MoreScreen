@@ -49,6 +49,52 @@ esac
 
 # 不使用 -i 显式指定私钥：ssh 默认即可从 ~/.ssh 读取，
 # 少一次文件打开可避开 Windows Defender 扫描导致的瞬时独占锁。
+
+# ---- 诊断信息（首次运行时记录，便于定位环境差异）----
+DIAG="$(git rev-parse --git-dir)/auto-push.diag"
+if [ ! -f "$DIAG" ]; then
+  {
+    echo "=== diag ==="
+    echo "HOME=${HOME:-<unset>}"
+    echo "USER=${USER:-<unset>}  whoami=$(whoami 2>&1)"
+    echo "MSYSTEM=${MSYSTEM:-<unset>}"
+    echo "GIT_DIR=${GIT_DIR:-<unset>}"
+    echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-<unset>}"
+    echo "--- ls HOME/.ssh ---"
+    ls -la "${HOME}/.ssh" 2>&1 | head -8
+    echo "--- known_hosts 头 ---"
+    head -1 "${HOME}/.ssh/known_hosts" 2>&1 | head -2
+    echo "--- 私钥可读? ---"
+    if head -c 32 "${HOME}/.ssh/id_ed25519" >/dev/null 2>&1; then echo "可读"; else echo "不可读"; fi
+    echo "--- ssh 版本/路径 ---"
+    ssh -V 2>&1 | head -1
+    which ssh 2>&1
+    echo "--- GIT_SSH_COMMAND 展开后 ---"
+    echo "ssh ${SSH_BASE:-<empty>}"
+  } > "$DIAG" 2>&1 || true
+fi
+
+
+# ---- 诊断信息（首次失败时记录，便于定位环境差异）----
+if [ ! -f "$(git rev-parse --git-dir)/auto-push.diag" ]; then
+  {
+    echo "=== diag @ $(stamp) ==="
+    echo "HOME=$HOME"
+    echo "USER=$USER  whoami=$(whoami 2>&1)"
+    echo "MSYSTEM=$MSYSTEM  SHELL=$SHELL"
+    echo "--- ls \$HOME/.ssh ---"
+    ls -la "$HOME/.ssh" 2>&1 | head -8
+    echo "--- head known_hosts ---"
+    head -1 "$HOME/.ssh/known_hosts" 2>&1 | head -2
+    echo "--- id_ed25519 可读? ---"
+    head -c 32 "$HOME/.ssh/id_ed25519" >/dev/null 2>&1 && echo "可读" || echo "不可读"
+    echo "--- ssh -V ---"
+    ssh -V 2>&1 | head -1
+    echo "--- which ssh ---"
+    which ssh 2>&1
+  } > "$(git rev-parse --git-dir)/auto-push.diag" 2>&1
+fi
+
 SSH_BASE="-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"
 
 try_push() {
