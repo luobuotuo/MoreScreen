@@ -68,3 +68,5 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
 - **坑 4**：需 `.gitattributes` 固定 `*.sh text eol=lf`，否则 Windows checkout 后 hook 脚本 CRLF 失效。
 - **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
 - **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
+- **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
+- **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
