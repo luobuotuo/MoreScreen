@@ -28,9 +28,12 @@
 - crates 走 rsproxy 稀疏索引（`~/.cargo/config.toml` 已配置）。
 
 ## 现状（2026-11-14）
-Stage 0 ✅ / Stage 1 ✅（枚举 24~35 个显示目标，虚拟屏判定可靠）/ Stage 2 ✅（物理主屏实测 60.1fps、首帧 14ms、1920×1080）。
-**阻塞点：本机 Parsec/ToDesk/AskLink 虚拟适配器未建会话时不暴露模式，无法点亮 → 需自装静态 VDD 或让客户端连一次。**
-未做：H.264 编码、WebRTC 传输、端到端延迟测量、像素级黑屏判定、macOS/Linux。
+Stage 0 ✅ / Stage 1 ✅（枚举 24~35 个显示目标，虚拟屏判定可靠）/ Stage 2 ✅（物理主屏实测 60.1fps、首帧 14ms、1920×1080）
+/ Stage 3a ✅（GPU 回读 + 亮度自检 240.8/99.5% + NV12 导出 3,110,400B，肉眼可读）。
+**阻塞点：本机 Parsec/ToDesk/AskLink 虚拟适配器未建会话时不暴露模式 → 已下载静态 VDD(MttVDD 25.7.23)，
+安装需 UAC 提权，等待用户确认；回滚 `pnputil /delete-driver mttvdd.inf /uninstall /force`。**
+未做：H.264 编码(MFT)、WebRTC 传输、端到端延迟测量、macOS/Linux。
+沙箱限制：PowerShell 工具禁止拉起 cmd.exe；提权用 `Start-Process -Verb RunAs` 直接调 pnputil.exe。
 
 ## 参考实现要点（Deskreen CE）
 Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传输 simple-peer/WebRTC；
