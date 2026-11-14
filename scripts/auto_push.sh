@@ -47,11 +47,9 @@ case "$HOME" in
     ;;
 esac
 
-KEY="$HOME/.ssh/id_ed25519"
+# 不使用 -i 显式指定私钥：ssh 默认即可从 ~/.ssh 读取，
+# 少一次文件打开可避开 Windows Defender 扫描导致的瞬时独占锁。
 SSH_BASE="-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"
-if [ -f "$KEY" ]; then
-  SSH_BASE="$SSH_BASE -i $KEY"
-fi
 
 try_push() {
   GIT_SSH_COMMAND="ssh $SSH_BASE" \
@@ -59,13 +57,16 @@ try_push() {
 }
 
 attempt=1
-while [ "$attempt" -le 3 ]; do
+MAX=5
+while [ "$attempt" -le "$MAX" ]; do
   if try_push; then
     echo "$(stamp) 已推送 $remote/$branch ($(git rev-parse --short HEAD))" >> "$LOG"
     exit 0
   fi
-  echo "$(stamp) 第 $attempt 次推送 $remote/$branch 失败，2 秒后重试" >> "$LOG"
-  sleep 2
+  if [ "$attempt" -lt "$MAX" ]; then
+    echo "$(stamp) 第 $attempt/$MAX 次推送 $remote/$branch 失败，5 秒后重试" >> "$LOG"
+    sleep 5
+  fi
   attempt=$((attempt + 1))
 done
 
