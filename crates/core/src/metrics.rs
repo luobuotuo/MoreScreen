@@ -79,7 +79,7 @@ impl MetricsRecorder {
             (b - a) as f64 * 1000.0 / self.qpc_freq
         };
         let line = format!(
-            "{{\"session_id\":{},\"display_id\":{},\"frame_id\":{},\
+            "{{\"session_id\":{},\"display_id\":\"{}\",\"frame_id\":{},\
 \"capture_src_ts\":{},\"capture_deq_ts\":{},\"enc_submit_ts\":{},\"enc_out_ts\":{},\"send_ts\":{},\
 \"capture_ms\":{:.3},\"encode_ms\":{:.3},\"to_send_ms\":{:.3},\"pipe_ms\":{:.3},\
 \"bytes\":{},\"keyframe\":{},\"drop\":{}}}\n",

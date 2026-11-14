@@ -216,6 +216,7 @@ pub fn capture_stream<F>(
     width: u32,
     height: u32,
     duration_ms: u64,
+    target_fps: u32,
     mut on_frame: F,
 ) -> Result<CaptureStats, String>
 where
@@ -251,6 +252,14 @@ where
         let start = Instant::now();
         let mut stats = CaptureStats::default();
         let mut last_ts: Option<Instant> = None;
+        // 帧率限速：采集频率（显示器刷新率）常高于编码目标帧率，
+        // 不限速会让编码器按错误的时间基播放，画面节奏失真。
+        let min_interval = if target_fps > 0 {
+            std::time::Duration::from_micros(1_000_000 / target_fps as u64)
+        } else {
+            std::time::Duration::from_micros(0)
+        };
+        let mut last_push: Option<Instant> = None;
 
         while (start.elapsed().as_millis() as u64) < duration_ms {
             match pool.TryGetNextFrame() {
@@ -279,9 +288,16 @@ where
                         stats.content_width = content.Width as u32;
                         stats.content_height = content.Height as u32;
                     }
+                    // 限速：到点才送帧
+                    if let Some(lp) = last_push {
+                        if now.duration_since(lp) < min_interval {
+                            continue;
+                        }
+                    }
                     if let Ok(surface) = frame.Surface() {
                         let (_, nv12) = analyze_surface(&d3d_device, &d3d_context, &surface, 16, true)?;
                         if let Some(buf) = nv12 {
+                            last_push = Some(now);
                             on_frame(&buf)?;
                         }
                     }

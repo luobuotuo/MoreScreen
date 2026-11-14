@@ -211,7 +211,9 @@ fn main() {
                 bitrate_kbps: 6000,
                 gop: 30,
             };
-            let mut enc = match remote_screen_host_win::encode::FfmpegEncoder::start(&cfg, &ffmpeg) {
+            let encoder = remote_screen_host_win::encode::detect_encoder(&ffmpeg);
+            println!("编码器      : {}", encoder);
+            let mut enc = match remote_screen_host_win::encode::FfmpegEncoder::start(&cfg, &ffmpeg, &encoder) {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("编码器启动失败: {e}");
@@ -268,16 +270,32 @@ fn main() {
                 // 实时模式：采集 -> 编码 -> 广播
                 let hub2 = hub.clone();
                 let mut enc2 = enc;
+                // 分段指标：采集就绪 → 提交编码 → 编码出流 → 发送完成
+                let metric_path = arg_value(&args, "--metrics")
+                    .unwrap_or_else(|| "out/metrics.jsonl".to_string());
+                let mut recorder =
+                    remote_screen_core::MetricsRecorder::create(std::path::Path::new(&metric_path), 1_000_000_000.0, 1)
+                        .ok();
+                let t_origin = std::time::Instant::now();
+                let mut frame_id: u64 = 0;
+                let mut last_sent: u64 = 0;
+                let mut push_ts: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
                 let res = remote_screen_host_win::capture::capture_stream(
                     target.bounds.x,
                     target.bounds.y,
                     target.mode.width,
                     target.mode.height,
                     seconds * 1000,
+                    cfg.fps,
                     |nv12| {
+                        let t_capture = t_origin.elapsed().as_nanos() as u64;
                         enc2.push_nv12(nv12)?;
+                        // 送帧时间戳入队：出流时按序弹出，保证指标对应到同一帧
+                        push_ts.push_back(t_capture);
                         let chunks = enc2.read_chunks()?;
                         for c in chunks {
+                            let t_enc_out = t_origin.elapsed().as_nanos() as u64;
+                            let t_frame = push_ts.pop_front().unwrap_or(t_capture);
                             let mut framed = Vec::with_capacity(c.data.len() + 1);
                             framed.push(if c.key { 1u8 } else { 0u8 });
                             framed.extend_from_slice(&c.data);
@@ -285,10 +303,36 @@ fn main() {
                                 hub2.set_keyframe(&framed);
                             }
                             hub2.broadcast(&framed);
+                            let t_send = t_origin.elapsed().as_nanos() as u64;
+                            frame_id += 1;
+                            if let Some(rec) = recorder.as_mut() {
+                                let _ = rec.record(&remote_screen_core::FrameRecord {
+                                    session_id: 1,
+                                    display_id: target.id.0.clone(),
+                                    frame_id,
+                                    capture_src_ts: t_frame,
+                                    capture_deq_ts: t_frame,
+                                    enc_submit_ts: t_frame,
+                                    enc_out_ts: t_enc_out,
+                                    send_ts: t_send,
+                                    bytes: framed.len() as u32,
+                                    keyframe: c.key,
+                                    drop_reason: None,
+                                });
+                            }
+                            last_sent = t_send;
                         }
+                        if let Some(rec) = recorder.as_mut() {
+                            let _ = rec.flush();
+                        }
+                        let _ = last_sent;
                         Ok(())
                     },
                 );
+                if let Some(mut rec) = recorder.take() {
+                    let _ = rec.flush();
+                    println!("分段指标已写入: {}", metric_path);
+                }
                 match res {
                     Ok(stats) => {
                         println!(

@@ -8,7 +8,7 @@
 //! 数据流：NV12 帧 → ffmpeg stdin → H.264 (Annex B) stdout → 访问单元切分。
 
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 
 /// 一次编码会话的输出：若干个 Annex B 访问单元。
 pub type AccessUnit = Vec<u8>;
@@ -24,7 +24,11 @@ pub struct FrameChunk {
 pub struct FfmpegEncoder {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: Option<ChildStdout>,
+    /// 编码输出通道：独立读线程持续读取 ffmpeg stdout，主循环只做非阻塞收取。
+    ///
+    /// 必须解耦：硬件编码器（如 QSV async_depth=1）常常"等到下一帧才吐数据"，
+    /// 若在推帧后阻塞等待输出，就会与编码器互相等待而死锁。
+    rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     /// 累积的 Annex B 字节缓冲（等待切分成访问单元）
     pending: Vec<u8>,
     /// 单帧 NV12 的期望字节数
@@ -56,45 +60,117 @@ impl Default for EncodeConfig {
     }
 }
 
-impl FfmpegEncoder {
-    /// 启动 ffmpeg 编码进程（低延迟参数）。
-    pub fn start(cfg: &EncodeConfig, ffmpeg_path: &str) -> Result<Self, String> {
-        let args = [
+/// 探测本机可用的 H.264 编码器（按硬件优先）。
+///
+/// 返回编码器名；`RS_ENCODER` 环境变量可强制指定。
+pub fn detect_encoder(ffmpeg_path: &str) -> String {
+    if let Ok(pref) = std::env::var("RS_ENCODER") {
+        let pref = pref.trim().to_string();
+        if !pref.is_empty() {
+            return pref;
+        }
+    }
+    // 硬件编码优先：Intel QSV -> NVIDIA NVENC -> AMD AMF -> 软件 libx264
+    for cand in ["h264_qsv", "h264_nvenc", "h264_amf", "libx264"] {
+        if encoder_works(ffmpeg_path, cand) {
+            return cand.to_string();
+        }
+    }
+    "libx264".to_string()
+}
+
+/// 用一小段合成画面验证编码器是否真的能跑。
+fn encoder_works(ffmpeg_path: &str, enc: &str) -> bool {
+    let out = Command::new(ffmpeg_path)
+        .args([
             "-hide_banner",
             "-loglevel",
             "error",
             "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "nv12",
-            "-s",
-            &format!("{}x{}", cfg.width, cfg.height),
-            "-r",
-            &cfg.fps.to_string(),
+            "lavfi",
             "-i",
-            "-",
+            "color=c=black:s=320x240:r=5",
+            "-frames:v",
+            "2",
             "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-b:v",
-            &format!("{}k", cfg.bitrate_kbps),
-            "-g",
-            &cfg.gop.to_string(),
-            "-keyint_min",
-            &cfg.gop.to_string(),
-            "-sc_threshold",
-            "0",
-            "-x264-params",
-            "nal-hrd=cbr:force-cfr=1",
-            "-bsf:v",
-            "h264_mp4toannexb",
+            enc,
             "-f",
-            "h264",
+            "null",
             "-",
+        ])
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
+impl FfmpegEncoder {
+    /// 启动 ffmpeg 编码进程（低延迟参数）。
+    pub fn start(cfg: &EncodeConfig, ffmpeg_path: &str, encoder: &str) -> Result<Self, String> {
+        let bps = format!("{}k", cfg.bitrate_kbps);
+        let gop = cfg.gop.to_string();
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            "nv12".into(),
+            "-s".into(),
+            format!("{}x{}", cfg.width, cfg.height),
+            "-r".into(),
+            cfg.fps.to_string(),
+            "-i".into(),
+            "-".into(),
         ];
+        match encoder {
+            "h264_qsv" => {
+                args.extend([
+                    "-c:v".into(), "h264_qsv".into(),
+                    "-preset".into(), "veryfast".into(),
+                    "-async_depth".into(), "1".into(),   // 低延迟：不排队
+                    "-look_ahead".into(), "0".into(),
+                    "-forced_idr".into(), "1".into(),
+                    "-b:v".into(), bps,
+                    "-g".into(), gop.clone(),
+                ]);
+            }
+            "h264_nvenc" => {
+                args.extend([
+                    "-c:v".into(), "h264_nvenc".into(),
+                    "-preset".into(), "p1".into(),
+                    "-tune".into(), "ull".into(),
+                    "-zerolatency".into(), "1".into(),
+                    "-forced_idr".into(), "1".into(),
+                    "-b:v".into(), bps,
+                    "-g".into(), gop.clone(),
+                ]);
+            }
+            "h264_amf" => {
+                args.extend([
+                    "-c:v".into(), "h264_amf".into(),
+                    "-quality".into(), "speed".into(),
+                    "-rc".into(), "cqp".into(),
+                    "-qp_i".into(), "24".into(),
+                    "-qp_p".into(), "24".into(),
+                    "-b:v".into(), bps,
+                    "-g".into(), gop.clone(),
+                ]);
+            }
+            _ => {
+                args.extend([
+                    "-c:v".into(), "libx264".into(),
+                    "-preset".into(), "ultrafast".into(),
+                    "-tune".into(), "zerolatency".into(),
+                    "-x264-params".into(), "nal-hrd=cbr:force-cfr=1".into(),
+                    "-b:v".into(), bps,
+                    "-g".into(), gop.clone(),
+                    "-keyint_min".into(), gop.clone(),
+                    "-sc_threshold".into(), "0".into(),
+                ]);
+            }
+        }
+        args.extend(["-bsf:v".into(), "h264_mp4toannexb".into(), "-f".into(), "h264".into(), "-".into()]);
+        let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let mut child = Command::new(ffmpeg_path)
             .args(&args)
             .stdin(Stdio::piped())
@@ -104,10 +180,27 @@ impl FfmpegEncoder {
             .map_err(|e| format!("启动 ffmpeg 失败（{ffmpeg_path}）: {e}"))?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        if let Some(mut out) = stdout {
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 64 * 1024];
+                loop {
+                    match out.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
         Ok(Self {
             child,
             stdin,
-            stdout,
+            rx: Some(rx),
             pending: Vec::new(),
             expected_len: (cfg.width as usize) * (cfg.height as usize) * 3 / 2,
             sps: None,
@@ -141,19 +234,18 @@ impl FfmpegEncoder {
     }
 
     /// 读取并切分输出访问单元（阻塞直到有数据）。
+    /// 非阻塞收取当前已可用的访问单元（不等待编码器）。
     pub fn read_units(&mut self) -> Result<Vec<AccessUnit>, String> {
-        let mut chunk = [0u8; 64 * 1024];
-        let stdout = self
-            .stdout
-            .as_mut()
-            .ok_or_else(|| "ffmpeg stdout 已关闭".to_string())?;
-        let n = stdout
-            .read(&mut chunk)
-            .map_err(|e| format!("读 ffmpeg stdout 失败: {e}"))?;
-        if n == 0 {
+        let mut got = false;
+        if let Some(rx) = self.rx.as_ref() {
+            while let Ok(chunk) = rx.try_recv() {
+                self.pending.extend_from_slice(&chunk);
+                got = true;
+            }
+        }
+        if !got && self.pending.is_empty() {
             return Ok(Vec::new());
         }
-        self.pending.extend_from_slice(&chunk[..n]);
         Ok(self.split_units())
     }
 
@@ -199,14 +291,18 @@ impl FfmpegEncoder {
             let nal_type = data[body] & 0x1F;
             let is_vcl = (1..=5).contains(&nal_type);
 
-            if is_vcl && cur_has_vcl {
-                // 上一个访问单元到本 NAL 之前结束
-                if let Some(cs) = cur_start {
-                    units.push(data[cs..start].to_vec());
-                    consumed = start;
-                    cur_start = Some(start);
+            if is_vcl {
+                // 访问单元边界判定：x264 一帧可能切成多个 slice，
+                // 只有 first_mb_in_slice == 0 的 slice 才是新访问单元的开始。
+                let new_au = starts_new_au(&data[body + 1..end]);
+                if new_au && cur_has_vcl {
+                    if let Some(cs) = cur_start {
+                        units.push(data[cs..start].to_vec());
+                        consumed = start;
+                        cur_start = Some(start);
+                    }
+                    cur_has_vcl = false;
                 }
-                cur_has_vcl = false;
             }
             if cur_start.is_none() {
                 cur_start = Some(start);
@@ -281,16 +377,10 @@ impl FfmpegEncoder {
     pub fn finish(&mut self) -> Result<Vec<AccessUnit>, String> {
         self.stdin.take();
         let mut units = Vec::new();
-        if let Some(stdout) = self.stdout.as_mut() {
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                match stdout.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        self.pending.extend_from_slice(&chunk[..n]);
-                    }
-                    Err(e) => return Err(format!("读 ffmpeg stdout 失败: {e}")),
-                }
+        // 等待读线程把剩余输出推完（通道断开即结束）
+        if let Some(rx) = self.rx.as_ref() {
+            while let Ok(chunk) = rx.recv() {
+                self.pending.extend_from_slice(&chunk);
             }
         }
         // 收尾：把剩余 pending 作为一个单元吐出
@@ -330,4 +420,126 @@ pub fn nal_types(data: &[u8]) -> Vec<u8> {
         i += 1;
     }
     types
+}
+
+
+/// 去掉防竞争字节（emulation prevention）：00 00 03 -> 00 00。
+fn strip_emulation_prevention(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut zeros = 0usize;
+    for &b in data {
+        if zeros >= 2 && b == 0x03 {
+            zeros = 0;
+            continue;
+        }
+        out.push(b);
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    out
+}
+
+/// 读取一个无符号指数哥伦布码 ue(v)。
+fn read_ue(data: &[u8], bitpos: &mut usize) -> Option<u32> {
+    let mut zeros = 0u32;
+    loop {
+        let byte = *data.get(*bitpos >> 3)?;
+        let bit = (byte >> (7 - (*bitpos & 7))) & 1;
+        *bitpos += 1;
+        if bit == 1 {
+            break;
+        }
+        zeros += 1;
+        if zeros > 32 {
+            return None;
+        }
+    }
+    if zeros == 0 {
+        return Some(0);
+    }
+    let mut v: u32 = 1;
+    for _ in 0..zeros {
+        let byte = *data.get(*bitpos >> 3)?;
+        let bit = (byte >> (7 - (*bitpos & 7))) & 1;
+        *bitpos += 1;
+        v = (v << 1) | bit as u32;
+    }
+    Some(v - 1)
+}
+
+/// 判断该 slice 是否开启一个新的访问单元（first_mb_in_slice == 0）。
+///
+/// `payload` 为去掉 NAL 头之后的 slice 负载。
+fn starts_new_au(payload: &[u8]) -> bool {
+    let rbsp = strip_emulation_prevention(payload);
+    let mut bitpos = 0usize;
+    match read_ue(&rbsp, &mut bitpos) {
+        Some(0) => true,
+        Some(_) => false,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造一个 slice 负载：first_mb_in_slice 用 ue(v) 编码。
+    fn slice_payload(first_mb: u32) -> Vec<u8> {
+        // ue(v) 编码：前导零个数 = floor(log2(v+1))
+        let v = first_mb + 1;
+        let mut bits: Vec<bool> = Vec::new();
+        let mut n = v;
+        let mut len = 0usize;
+        while (1usize << len) < v as usize + 1 {
+            len += 1;
+        }
+        n = v;
+        let _ = n;
+        // 简化：len 位表示 (v+1) 的二进制长度
+        let zeros = len - 1;
+        for _ in 0..zeros {
+            bits.push(false);
+        }
+        let mut tmp = v;
+        for i in (0..zeros).rev() {
+            bits.push((tmp >> i) & 1 == 1);
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut cur: u8 = 0;
+        let mut nbits = 0u8;
+        for b in bits {
+            cur = (cur << 1) | (b as u8);
+            nbits += 1;
+            if nbits == 8 {
+                out.push(cur);
+                cur = 0;
+                nbits = 0;
+            }
+        }
+        if nbits > 0 {
+            out.push(cur << (8 - nbits));
+        }
+        out
+    }
+
+    #[test]
+    fn first_mb_zero_starts_new_au() {
+        assert!(starts_new_au(&slice_payload(0)));
+    }
+
+    #[test]
+    fn non_zero_first_mb_continues_au() {
+        assert!(!starts_new_au(&slice_payload(5)));
+        assert!(!starts_new_au(&slice_payload(120)));
+    }
+
+    #[test]
+    fn emulation_prevention_is_stripped() {
+        let raw = [0x00u8, 0x00, 0x03, 0x01];
+        assert_eq!(strip_emulation_prevention(&raw), vec![0x00, 0x00, 0x01]);
+    }
 }
