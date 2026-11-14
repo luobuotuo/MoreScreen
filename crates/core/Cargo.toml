@@ -1,0 +1,8 @@
+[package]
+name = "remote-screen-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "跨平台核心：显示模型、会话状态机、链路指标（无平台依赖，可独立测试）"
+
+[dependencies]
