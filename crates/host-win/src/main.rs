@@ -157,6 +157,151 @@ fn main() {
                 }
             }
         }
+        "stream" => {
+            // 采集 -> H.264 编码 -> WebSocket 广播 -> 浏览器解码
+            let ws_port = arg_value(&args, "--port")
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(8787);
+            let http_port = ws_port + 1;
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let seconds = arg_value(&args, "--seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60);
+            let ffmpeg = match resolve_ffmpeg() {
+                Some(p) => p,
+                None => {
+                    eprintln!("未找到 ffmpeg：请设置环境变量 RS_FFMPEG 指向 ffmpeg.exe，或放到 tools/ffmpeg/bin/");
+                    std::process::exit(4);
+                }
+            };
+            let (hub, ws_bound) = match remote_screen_host_win::serve::start_ws(ws_port) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("WebSocket 服务启动失败: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let page = "web/receiver/index.html";
+            let http_bound = remote_screen_host_win::serve::start_http(http_port, page)
+                .map(|p| p)
+                .unwrap_or(http_port);
+            let ip = remote_screen_host_win::serve::local_ipv4()
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            println!("ffmpeg      : {}", ffmpeg);
+            println!("WS 服务     : ws://{ip}:{ws_bound}");
+            println!("接收端页面  : http://{ip}:{http_bound}/");
+            println!("等待接收端连接…");
+
+            let displays = enumerate_displays();
+            let target = match displays.get(index) {
+                Some(d) => d,
+                None => {
+                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    std::process::exit(2);
+                }
+            };
+            println!("采集目标    : {}", target.label());
+
+            let cfg = remote_screen_host_win::encode::EncodeConfig {
+                width: target.mode.width.max(16),
+                height: target.mode.height.max(16),
+                fps: 30,
+                bitrate_kbps: 6000,
+                gop: 30,
+            };
+            let mut enc = match remote_screen_host_win::encode::FfmpegEncoder::start(&cfg, &ffmpeg) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("编码器启动失败: {e}");
+                    std::process::exit(6);
+                }
+            };
+
+            // 文件模式：循环推送同一帧（用于无虚拟屏时验证编码/传输/解码链路）
+            if let Some(path) = arg_value(&args, "--nv12") {
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("读取 NV12 文件失败: {e}");
+                        std::process::exit(7);
+                    }
+                };
+                println!("文件模式    : {} ({} 字节)", path, data.len());
+                let frame_time = std::time::Duration::from_millis(1000 / cfg.fps as u64);
+                let mut next = std::time::Instant::now();
+                loop {
+                    if let Err(e) = enc.push_nv12(&data) {
+                        eprintln!("推帧失败: {e}");
+                        break;
+                    }
+                    match enc.read_chunks() {
+                        Ok(chunks) => {
+                            for c in chunks {
+                                let mut framed = Vec::with_capacity(c.data.len() + 1);
+                                framed.push(if c.key { 1u8 } else { 0u8 });
+                                framed.extend_from_slice(&c.data);
+                                if c.key {
+                                    hub.set_keyframe(&framed);
+                                }
+                                let (_ok, dead) = hub.broadcast(&framed);
+                                if dead > 0 {
+                                    println!("清理断开客户端: {}", dead);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("读码流失败: {e}");
+                            break;
+                        }
+                    }
+                    next += frame_time;
+                    let now = std::time::Instant::now();
+                    if next > now {
+                        std::thread::sleep(next - now);
+                    } else {
+                        next = now;
+                    }
+                }
+            } else {
+                // 实时模式：采集 -> 编码 -> 广播
+                let hub2 = hub.clone();
+                let mut enc2 = enc;
+                let res = remote_screen_host_win::capture::capture_stream(
+                    target.bounds.x,
+                    target.bounds.y,
+                    target.mode.width,
+                    target.mode.height,
+                    seconds * 1000,
+                    |nv12| {
+                        enc2.push_nv12(nv12)?;
+                        let chunks = enc2.read_chunks()?;
+                        for c in chunks {
+                            let mut framed = Vec::with_capacity(c.data.len() + 1);
+                            framed.push(if c.key { 1u8 } else { 0u8 });
+                            framed.extend_from_slice(&c.data);
+                            if c.key {
+                                hub2.set_keyframe(&framed);
+                            }
+                            hub2.broadcast(&framed);
+                        }
+                        Ok(())
+                    },
+                );
+                match res {
+                    Ok(stats) => {
+                        println!(
+                            "采集结束: {} 帧 / {:.1} fps / 首帧 {:.1} ms",
+                            stats.frames,
+                            if stats.avg_interval_ms > 0.0 { 1000.0 / stats.avg_interval_ms } else { 0.0 },
+                            stats.first_frame_delay_ms
+                        );
+                    }
+                    Err(e) => eprintln!("采集失败: {e}"),
+                }
+            }
+        }
         "capture-probe" => {
             // 采集探测：抓取指定显示器若干秒，输出帧率与内容尺寸
             let displays = enumerate_displays();
@@ -232,7 +377,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--index N] [--seconds S] | capture-dump [--index N] [--out file.nv12]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe | capture-dump | stream [--index N] [--port P] [--seconds S] [--nv12 file]>");
         }
     }
 }
@@ -241,4 +386,54 @@ fn main() {
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     let pos = args.iter().position(|a| a == key)?;
     args.get(pos + 1).cloned()
+}
+
+/// 定位 ffmpeg 可执行文件：环境变量 → tools/ffmpeg/bin → PATH → WinGet 链接目录。
+fn resolve_ffmpeg() -> Option<String> {
+    if let Ok(p) = std::env::var("RS_FFMPEG") {
+        let p = p.trim().to_string();
+        if !p.is_empty() && std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    let candidates = [
+        "tools/ffmpeg/bin/ffmpeg.exe",
+        "tools/ffmpeg/ffmpeg.exe",
+        "C:/Users/sz-ws016/AppData/Local/Microsoft/WinGet/Links/ffmpeg.exe",
+    ];
+    for c in candidates {
+        if std::path::Path::new(c).exists() {
+            return Some(c.to_string());
+        }
+    }
+    if which("ffmpeg") {
+        Some("ffmpeg".to_string())
+    } else {
+        None
+    }
+}
+
+/// 在 PATH 中查找可执行文件（Windows 下用 PATHEXT 逐个扩展名尝试）。
+fn which(name: &str) -> bool {
+    let path = match std::env::var("PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let exts = if cfg!(windows) {
+        vec![".exe", ".cmd", ".bat"]
+    } else {
+        vec![""]
+    };
+    for dir in path.split(';') {
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in &exts {
+            let full = format!("{}/{}{}", dir.trim_end_matches('\\'), name, ext);
+            if std::path::Path::new(&full).exists() {
+                return true;
+            }
+        }
+    }
+    false
 }

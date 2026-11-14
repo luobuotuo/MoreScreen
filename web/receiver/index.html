@@ -3,84 +3,149 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>remote-screen 接收端（Stage 4 骨架）</title>
+<title>remote-screen 接收端</title>
 <style>
   :root { color-scheme: dark; }
-  body { margin: 0; background: #101114; color: #e8eaed; font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  body { margin: 0; background: #101114; color: #e8eaed; font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
   header { padding: 10px 14px; border-bottom: 1px solid #26282e; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
   h1 { font-size: 15px; margin: 0; font-weight: 600; }
   .stat { color: #9aa0a6; font-variant-numeric: tabular-nums; }
   .stat b { color: #8ab4f8; font-weight: 600; }
-  #stage { padding: 24px; }
-  video { width: 100%; height: auto; background: #000; border-radius: 8px; display: block; }
+  #stage { padding: 16px; }
+  canvas { width: 100%; height: auto; background: #000; border-radius: 8px; display: block; }
   .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
   .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
   code { background: #26282e; padding: 1px 5px; border-radius: 4px; }
+  .err { color: #f28b82; }
 </style>
 </head>
 <body>
 <header>
   <h1>remote-screen 接收端</h1>
   <span class="stat">状态 <b id="state">未连接</b></span>
+  <span class="stat">解码帧 <b id="dec">0</b></span>
   <span class="stat">帧率 <b id="fps">–</b></span>
+  <span class="stat">码率 <b id="rate">–</b></span>
   <span class="stat">分辨率 <b id="res">–</b></span>
-  <span class="stat">丢包 <b id="lost">–</b></span>
-  <span class="stat">抖动缓冲 <b id="jbd">–</b></span>
-  <span class="stat">RTT <b id="rtt">–</b></span>
+  <span class="stat">丢弃 <b id="drop">0</b></span>
+  <span class="stat err" id="err"></span>
 </header>
 <div id="stage">
-  <video id="v" autoplay playsinline muted></video>
+  <canvas id="cv"></canvas>
   <div class="bar"><i id="bar"></i></div>
-  <p class="stat" style="margin-top:14px">
-    当前为 Stage 4 骨架：已内置 <code>getStats()</code> 采集与 <code>requestVideoFrameCallback</code> 呈现节奏统计。
-    正式链路将使用 WebRTC（<code>RTCPeerConnection</code> + <code>recvonly</code> 视频轨），
-    传输层替换不影响本页的统计与渲染逻辑。
+  <p class="stat" style="margin-top:12px" id="hint">
+    接收端通过 WebSocket 拉取 H.264 访问单元，用 WebCodecs 解码后绘制到 Canvas。
+    解码器会在 avc1.42E01F / avc1.42001F / avc1.640028 等候选配置中自动选择浏览器支持的。
   </p>
 </div>
 <script>
-// —— 统计与渲染骨架（先于传输实现落地，保证指标口径一致）——
 const el = id => document.getElementById(id);
-const video = el('v');
-let frameTimes = [];
+const cv = el('cv');
+const ctx = cv.getContext('2d');
+const WS_PORT = 8787;
+const CODEC_CANDIDATES = ['avc1.42E01F','avc1.42001F','avc1.4D401F','avc1.640028','avc1.64001F'];
 
-function updateFrameRate(now) {
-  frameTimes.push(now);
-  while (frameTimes.length && now - frameTimes[0] > 2000) frameTimes.shift();
-  const fps = frameTimes.length > 1 ? (frameTimes.length - 1) * 1000 / (now - frameTimes[0]) : 0;
-  el('fps').textContent = fps.toFixed(1);
-  el('bar').style.width = Math.min(100, fps / 60 * 100) + '%';
+let decoder = null, decoded = 0, dropped = 0, bytes = 0;
+let pendingChunks = [];   // 解码器就绪前先排队，避免丢掉第一个关键帧
+let firstError = '';
+let lastRateTs = performance.now(), lastBytes = 0, frameTimes = [];
+
+// 注意：isConfigSupported() 返回 Promise，必须 await，否则拿不到 supported 字段
+async function pickCodec(width, height) {
+  for (const codec of CODEC_CANDIDATES) {
+    const cfg = { codec, codedWidth: width, codedHeight: height, avc: { format: 'annexb' } };
+    try {
+      const r = await VideoDecoder.isConfigSupported(cfg);
+      if (r && r.supported) return cfg;
+    } catch (e) {}
+  }
+  return null;
 }
 
-if (typeof video.requestVideoFrameCallback === 'function') {
-  const onFrame = (now, meta) => {
-    updateFrameRate(now);
-    if (meta && meta.presentedFrames !== undefined) {
-      el('state').textContent = '播放中';
-    }
-    video.requestVideoFrameCallback(onFrame);
-  };
-  video.requestVideoFrameCallback(onFrame);
+function onFrame(frame) {
+  const w = frame.displayWidth, h = frame.displayHeight;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; el('res').textContent = w + '\u00d7' + h; }
+  ctx.drawImage(frame, 0, 0, w, h);
+  frame.close();
+  decoded++; el('dec').textContent = decoded;
 }
 
-video.addEventListener('loadedmetadata', () => {
-  el('res').textContent = video.videoWidth + '×' + video.videoHeight;
-});
-
-// 预留：建立 WebRTC 接收端后，用 getStats() 填充丢包/抖动缓冲/RTT
-window.__rsStats = async (pc) => {
-  if (!pc) return;
-  const report = await pc.getStats();
-  report.forEach(s => {
-    if (s.type === 'inbound-rtp' && s.kind === 'video') {
-      el('lost').textContent = s.packetsLost ?? '–';
-      const delay = s.jitterBufferDelay, count = s.jitterBufferEmittedCount;
-      el('jbd').textContent = (delay && count) ? (delay / count * 1000).toFixed(1) + ' ms' : '–';
-    }
-    if (s.type === 'candidate-pair' && s.state === 'succeeded') {
-      el('rtt').textContent = s.currentRoundTripTime != null
-        ? (s.currentRoundTripTime * 1000).toFixed(0) + ' ms' : '–';
+let decoderStarting = false;
+async function startDecoder(width, height) {
+  if (decoderStarting || decoder) return !!decoder;
+  decoderStarting = true;
+  const cfg = await pickCodec(width, height);
+  decoderStarting = false;
+  if (!cfg) { el('state').textContent = '\u6d4f\u89c8\u5668\u4e0d\u652f\u6301 H.264 \u89e3\u7801'; el('hint').className = 'stat err'; return false; }
+  decoder = new VideoDecoder({
+    output: onFrame,
+    error: e => {
+      firstError = String(e);
+      el('state').textContent = '\u89e3\u7801\u9519\u8bef';
+      el('hint').className = 'stat err';
+      el('hint').textContent = 'decode error: ' + firstError;
+      el('err').textContent = firstError.slice(0, 60);
     }
   });
+  decoder.configure(cfg);
+  el('state').textContent = '\u89e3\u7801\u4e2d';
+  // 把排队的数据按顺序喂进去（第一个必须是关键帧）
+  const queued = pendingChunks;
+  pendingChunks = [];
+  for (const it of queued) feed(it.type, it.data);
+  return true;
+}
+
+/** 把一个访问单元喂给解码器。 */
+function feed(type, data) {
+  if (!decoder || decoder.state === 'closed') return;
+  try {
+    decoder.decode(new EncodedVideoChunk({ type, data, timestamp: performance.now() * 1000 }));
+  } catch (e) {
+    dropped++; el('drop').textContent = dropped;
+  }
+}
+
+const ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT + '/');
+ws.binaryType = 'arraybuffer';
+let firstChunk = true;
+
+ws.onopen = () => { el('state').textContent = '\u5df2\u8fde\u63a5\uff0c\u7b49\u5f85\u6570\u636e'; };
+ws.onclose = () => { el('state').textContent = '\u8fde\u63a5\u5df2\u65ad\u5f00'; };
+ws.onerror = () => { el('state').textContent = '\u8fde\u63a5\u9519\u8bef'; };
+
+ws.onmessage = (ev) => {
+  const raw = new Uint8Array(ev.data);
+  const isKey = raw.length > 0 && raw[0] === 1;
+  const data = raw.length > 1 ? raw.subarray(1) : raw;
+  bytes += data.byteLength;
+  const now = performance.now();
+  if (now - lastRateTs > 1000) {
+    el('rate').textContent = (((bytes - lastBytes) * 8) / (now - lastRateTs)).toFixed(0) + ' kbps';
+    lastBytes = bytes; lastRateTs = now;
+  }
+  const type = (firstChunk || isKey) ? 'key' : 'delta';
+  firstChunk = false;
+  if (!decoder) {
+    // 解码器还没就绪：先排队（保留关键帧），随后按序补喂
+    pendingChunks.push({ type, data });
+    if (pendingChunks.length > 60) pendingChunks.shift();
+    startDecoder(1920, 1080);
+    return;
+  }
+  feed(type, data);
+  // 诊断：把解码器内部状态写到标题栏，便于无头环境取证
+  el('state').textContent = '解码中';
+  document.title = 'DIAG state=' + (decoder ? decoder.state : 'none') +
+    ' queue=' + (decoder ? decoder.decodeQueueSize : -1) +
+    ' decoded=' + decoded + ' dropped=' + dropped +
+    ' err=' + firstError.slice(0, 40);
+  frameTimes.push(now);
+  while (frameTimes.length && now - frameTimes[0] > 2000) frameTimes.shift();
+  const fps = (frameTimes.length > 1 && now > frameTimes[0])
+    ? (frameTimes.length - 1) * 1000 / (now - frameTimes[0]) : 0;
+  el('fps').textContent = fps.toFixed(1);
+  el('bar').style.width = Math.min(100, fps / 60 * 100) + '%';
 };
 </script>
 </body>

@@ -7,6 +7,7 @@ description = "Windows 宿主端：显示枚举 / WGC 采集 / Media Foundation 
 
 [dependencies]
 remote-screen-core = { path = "../core" }
+tungstenite = "0.21"
 windows = { version = "0.61", default-features = false, features = [
     "Foundation",
     "Graphics_Capture",

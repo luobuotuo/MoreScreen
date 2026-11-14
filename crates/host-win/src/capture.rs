@@ -204,3 +204,93 @@ pub fn probe_capture(
         Ok(stats)
     }
 }
+
+
+/// 实时采集并把每帧转成 NV12 交给回调（供编码器消费）。
+///
+/// 与 `probe_capture` 的区别：本函数每帧都做回读与色彩转换，
+/// 因此可以真正做到"采集 → 编码"连续流式处理。
+pub fn capture_stream<F>(
+    bounds_x: i32,
+    bounds_y: i32,
+    width: u32,
+    height: u32,
+    duration_ms: u64,
+    mut on_frame: F,
+) -> Result<CaptureStats, String>
+where
+    F: FnMut(&[u8]) -> Result<(), String>,
+{
+    unsafe {
+        let hmonitor = monitor_from_bounds(bounds_x, bounds_y, width, height);
+        if hmonitor.0.is_null() {
+            return Err("MonitorFromPoint 未返回有效 HMONITOR".into());
+        }
+        let (d3d_device, d3d_context, winrt_device) = create_device()?;
+        let interop: IGraphicsCaptureItemInterop =
+            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .map_err(|e| format!("获取 IGraphicsCaptureItemInterop 失败: {e}"))?;
+        let item: GraphicsCaptureItem = interop
+            .CreateForMonitor(hmonitor)
+            .map_err(|e| format!("CreateForMonitor 失败: {e}"))?;
+        let size = SizeInt32 { Width: width as i32, Height: height as i32 };
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        )
+        .map_err(|e| format!("创建 Direct3D11CaptureFramePool 失败: {e}"))?;
+        let session = pool
+            .CreateCaptureSession(&item)
+            .map_err(|e| format!("创建 GraphicsCaptureSession 失败: {e}"))?;
+        session
+            .StartCapture()
+            .map_err(|e| format!("StartCapture 失败: {e}"))?;
+
+        let start = Instant::now();
+        let mut stats = CaptureStats::default();
+        let mut last_ts: Option<Instant> = None;
+
+        while (start.elapsed().as_millis() as u64) < duration_ms {
+            match pool.TryGetNextFrame() {
+                Ok(frame) => {
+                    let now = Instant::now();
+                    if let Some(prev) = last_ts {
+                        let interval = now.duration_since(prev).as_secs_f64() * 1000.0;
+                        stats.avg_interval_ms = if stats.frames == 0 {
+                            interval
+                        } else {
+                            stats.avg_interval_ms
+                                + (interval - stats.avg_interval_ms) / (stats.frames as f64)
+                        };
+                        stats.max_interval_ms = stats.max_interval_ms.max(interval);
+                        stats.min_interval_ms = if stats.min_interval_ms == 0.0 {
+                            interval
+                        } else {
+                            stats.min_interval_ms.min(interval)
+                        };
+                    } else {
+                        stats.first_frame_delay_ms = now.duration_since(start).as_secs_f64() * 1000.0;
+                    }
+                    last_ts = Some(now);
+                    stats.frames += 1;
+                    if let Ok(content) = frame.ContentSize() {
+                        stats.content_width = content.Width as u32;
+                        stats.content_height = content.Height as u32;
+                    }
+                    if let Ok(surface) = frame.Surface() {
+                        let (_, nv12) = analyze_surface(&d3d_device, &d3d_context, &surface, 16, true)?;
+                        if let Some(buf) = nv12 {
+                            on_frame(&buf)?;
+                        }
+                    }
+                }
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        Ok(stats)
+    }
+}
