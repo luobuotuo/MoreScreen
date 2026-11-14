@@ -1,19 +1,34 @@
-# remote-screen（多屏扩展 · 第一版）
+# MoreScreen（多屏扩展 · 第一版）
+
+> 远端仓库：<https://github.com/luobuotuo/MoreScreen>（SSH：`git@github.com:luobuotuo/MoreScreen.git`）
 
 把闲置的平板/手机/旧电脑变成电脑的**第二块屏幕**，走的是"虚拟显示器 + 原生采集编码 + 局域网传输"的路线，
 架构参考与对标对象是 [Deskreen](https://deskreen.com)（AGPL-3.0，本仓库仅作原理参考，未复制其代码）。
 
-当前进度：**Stage 0 / Stage 1 完成，Stage 2（采集）已在真机跑通并有实测数据**。
-详细进度见 [`docs/01-progress.md`](docs/01-progress.md)，环境基线见 [`docs/00-baseline.md`](docs/00-baseline.md)。
+当前进度（实测，非计划）：
+
+| 阶段 | 状态 | 关键数据 |
+|---|---|---|
+| Stage 0 基线 | ✅ | Win10 19045 / Intel Iris Xe / 1920×1080@60 |
+| Stage 1 枚举 | ✅ | 37 个显示目标，虚拟判定可靠 |
+| Stage 2 采集 | ✅ | WGC+D3D11 60.1fps、首帧 14.1ms、亮度自检 240.8/99.5% |
+| Stage 3 编码 | ✅ | H.264 Constrained Baseline 1920×1080，`h264_qsv` 硬编可用 |
+| Stage 4 传输 | ✅ | WebSocket 广播 + 浏览器解码器配置成功；AU `[SPS,PPS,IDR]` 可独立解码 |
+| Stage 5 测量 | ⚠️ | 主机侧 p50 175ms / p95 204ms；瓶颈=CPU 侧 BGRA→NV12 转换 |
+| 虚拟屏 | ❌ | VDD 节点已建（`ROOT\MTTVDD\0000`），但驱动被签名策略拒绝加载 |
+
+详细进度见 [`docs/01-progress.md`](docs/01-progress.md)，环境基线见 [`docs/00-baseline.md`](docs/00-baseline.md)，
+虚拟屏出路见 [`docs/02-vdd-options.md`](docs/02-vdd-options.md)，Git 工作流见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)。
 
 ## 目录
 
 ```
 crates/core/       平台无关核心：显示模型 / 会话状态机 / 分段指标（零依赖）
-crates/host-win/   Windows 宿主端：显示枚举 + WGC 采集
-web/receiver/      浏览器接收端骨架（Stage 4）
-scripts/env.sh     环境变量（代理绕过 + 构建目录 + PATH）
-docs/              基线与进度文档
+crates/host-win/   Windows 宿主端：显示枚举 / WGC 采集 / GPU 回读 / H.264 编码 / WS 传输 / VDD 节点
+web/receiver/      浏览器接收端（WebCodecs 解码 + 统计）
+scripts/           env.sh（环境变量）/ auto_push.sh（提交自动推送）/ ws_probe.py / screen_grab.py
+tools/             VDD 驱动包、SetupAPI 建节点脚本、一键安装脚本
+docs/              基线 / 进度 / 虚拟屏出路 / Git 工作流
 ```
 
 ## 快速开始
