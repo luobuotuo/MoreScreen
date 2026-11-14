@@ -4,17 +4,30 @@
 #
 #  设计原则
 #  1. 推送失败**绝不阻塞提交**（post-commit 的退出码不影响 commit 成功）；
-#  2. 失败自动重试（Windows 上 known_hosts 偶发瞬时文件锁：Permission denied）；
+#  2. 失败自动重试；
 #  3. 每次执行结果写入 .git/auto-push.log，便于事后排查；
 #  4. 未绑定远端时静默跳过，不产生噪音。
 #
 #  开关：git config auto-push.enabled false   可临时关闭
+#
+#  关键经验（本机实测）
+#  ---------------------------------------------------------------------------
+#  * 不要用 GIT_SSH_COMMAND 覆盖 ssh 调用方式。
+#    带 GIT_SSH_COMMAND 时，git 走 `sh -c` 二次解析，MSYS2 会在这一步把
+#    ~/.ssh 访问路径改写，ssh 报 "Load key ...: Permission denied" +
+#    "Failed to add the host to the list of known hosts"；
+#    而**默认调用方式（不设 GIT_SSH_COMMAND）在同一台机器上手动 push 是成功的**。
+#  * 必须把 HOME 规范成 POSIX 形式（/c/Users/...），Windows 形式（C:\Users\...）
+#    会让 MSYS2 的 OpenSSH 拼出非法路径。
+#  * 关闭 MSYS2 参数转换，避免子进程拿到被改写的路径。
 # ---------------------------------------------------------------------------
 set -u
 
 LOG="$(git rev-parse --git-dir)/auto-push.log"
+DIAG="$(git rev-parse --git-dir)/auto-push.diag"
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# ---- 开关检查 ----
 enabled="$(git config --get auto-push.enabled || echo true)"
 if [ "$enabled" != "true" ]; then
   echo "$(stamp) 自动推送已被关闭（git config auto-push.enabled false）" >> "$LOG"
@@ -31,11 +44,7 @@ if ! git remote get-url "$remote" >/dev/null 2>&1; then
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-#  HOME 必须是 POSIX 形式。
-#  Git Bash 的 OpenSSH 在 HOME 为 Windows 形式（C:\Users\...）时会把
-#  known_hosts 拼成非法路径，导致 "Permission denied" / "Host key verification failed"。
-# ---------------------------------------------------------------------------
+# ---- HOME 规范化为 POSIX 形式 ----
 if [ -z "${HOME:-}" ]; then
   HOME="$(cd "$(git rev-parse --git-dir)/../.." && pwd)"
   export HOME
@@ -47,88 +56,45 @@ case "$HOME" in
     ;;
 esac
 
-# 不使用 -i 显式指定私钥：ssh 默认即可从 ~/.ssh 读取，
-# 少一次文件打开可避开 Windows Defender 扫描导致的瞬时独占锁。
+# ---- 关闭 MSYS2 路径/参数转换，避免子进程拿到被改写的 ~/.ssh 路径 ----
+export MSYS2_ARG_CONV_EXCL='*'
+export MSYS_NO_PATHCONV=1
+# 任何交互式提示都不允许（防止后台推送卡死）
+export GIT_TERMINAL_PROMPT=0
 
-# ---- 诊断信息（首次运行时记录，便于定位环境差异）----
-DIAG="$(git rev-parse --git-dir)/auto-push.diag"
+# ---- 首次运行时记录一次 ssh 连通性诊断 ----
 if [ ! -f "$DIAG" ]; then
   {
-    echo "=== diag ==="
-    echo "HOME=${HOME:-<unset>}"
+    echo "=== 诊断 @ $(stamp) ==="
+    echo "HOME=$HOME"
     echo "USER=${USER:-<unset>}  whoami=$(whoami 2>&1)"
     echo "MSYSTEM=${MSYSTEM:-<unset>}"
-    echo "GIT_DIR=${GIT_DIR:-<unset>}"
-    echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-<unset>}"
-    echo "--- ls HOME/.ssh ---"
-    ls -la "${HOME}/.ssh" 2>&1 | head -8
-    echo "--- known_hosts 头 ---"
-    head -1 "${HOME}/.ssh/known_hosts" 2>&1 | head -2
-    echo "--- 私钥可读? ---"
-    if head -c 32 "${HOME}/.ssh/id_ed25519" >/dev/null 2>&1; then echo "可读"; else echo "不可读"; fi
-    echo "--- ssh 版本/路径 ---"
-    ssh -V 2>&1 | head -1
+    echo "--- ssh 直连测试 ---"
+    ssh -o BatchMode=yes -T git@github.com 2>&1 | head -3
+    echo "--- ssh 路径 ---"
     which ssh 2>&1
-    echo "--- GIT_SSH_COMMAND 展开后 ---"
-    echo "ssh ${SSH_BASE:-<empty>}"
-  } > "$DIAG" 2>&1 || true
-fi
-    echo "--- ssh 版本/路径 ---"
     ssh -V 2>&1 | head -1
-    which ssh 2>&1
-    echo "--- GIT_SSH_COMMAND 展开后 ---"
-    echo "ssh ${SSH_BASE:-<empty>}"
   } > "$DIAG" 2>&1 || true
 fi
 
-
-# ---- 诊断信息（首次失败时记录，便于定位环境差异）----
-if [ ! -f "$(git rev-parse --git-dir)/auto-push.diag" ]; then
-  {
-    echo "=== diag @ $(stamp) ==="
-    echo "HOME=$HOME"
-    echo "USER=$USER  whoami=$(whoami 2>&1)"
-    echo "MSYSTEM=$MSYSTEM  SHELL=$SHELL"
-    echo "--- ls \$HOME/.ssh ---"
-    ls -la "$HOME/.ssh" 2>&1 | head -8
-    echo "--- head known_hosts ---"
-    head -1 "$HOME/.ssh/known_hosts" 2>&1 | head -2
-    echo "--- id_ed25519 可读? ---"
-    head -c 32 "$HOME/.ssh/id_ed25519" >/dev/null 2>&1 && echo "可读" || echo "不可读"
-    echo "--- ssh -V ---"
-    ssh -V 2>&1 | head -1
-    echo "--- which ssh ---"
-    which ssh 2>&1
-  } > "$(git rev-parse --git-dir)/auto-push.diag" 2>&1
-fi
-
-SSH_BASE="-o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new"
-
+# ---- 推送（使用 git 默认的 ssh 调用方式，不用 GIT_SSH_COMMAND）----
 try_push() {
-  GIT_SSH_COMMAND="ssh $SSH_BASE" \
-    git push --quiet "$remote" "HEAD:refs/heads/$branch" >>"$LOG" 2>&1
+  git push --quiet "$remote" "HEAD:refs/heads/$branch" >>"$LOG" 2>&1
 }
 
 attempt=1
-MAX=5
+MAX=4
 while [ "$attempt" -le "$MAX" ]; do
   if try_push; then
     echo "$(stamp) 已推送 $remote/$branch ($(git rev-parse --short HEAD))" >> "$LOG"
     exit 0
   fi
   if [ "$attempt" -lt "$MAX" ]; then
-    echo "$(stamp) 第 $attempt/$MAX 次推送 $remote/$branch 失败，5 秒后重试" >> "$LOG"
-    sleep 5
+    echo "$(stamp) 第 $attempt/$MAX 次推送 $remote/$branch 失败，4 秒后重试" >> "$LOG"
+    sleep 4
   fi
   attempt=$((attempt + 1))
 done
 
-echo "$(stamp) 已知主机校验反复失败，最后一次尝试忽略 known_hosts" >> "$LOG"
-if GIT_SSH_COMMAND="ssh $SSH_BASE -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no" \
-   git push --quiet "$remote" "HEAD:refs/heads/$branch" >>"$LOG" 2>&1; then
-  echo "$(stamp) 已推送 $remote/$branch（忽略 known_hosts 成功）" >> "$LOG"
-else
-  echo "$(stamp) 推送失败（提交本身已成功，不影响本地历史）" >> "$LOG"
-fi
-
+echo "$(stamp) 推送 $remote/$branch 最终失败（提交本身已成功，不影响本地历史）" >> "$LOG"
 exit 0
