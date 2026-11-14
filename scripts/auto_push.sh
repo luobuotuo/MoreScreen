@@ -80,20 +80,27 @@ export GIT_TERMINAL_PROMPT=0
 tail -c 6000 "$DIAG" > "$DIAG.tmp" 2>/dev/null && mv "$DIAG.tmp" "$DIAG" 2>/dev/null || true
 
 # ---- 推送（使用 git 默认的 ssh 调用方式，不用 GIT_SSH_COMMAND）----
+#  为什么要先等一下：
+#  `git commit` 会写入大量对象/index 文件，触发 Defender 扫描；Defender 随后会
+#  以独占方式打开 ~/.ssh 下的私钥与 known_hosts 做检查，此时 ssh 读取它们会
+#  得到 "Permission denied"。手动 push 因为没有这批文件写入所以不复现。
+#  因此推送前先静默等待扫描窗口过去，再配合多次重试兜底。
+sleep "${RS_PUSH_DELAY:-6}"
+
 try_push() {
   git push --quiet "$remote" "HEAD:refs/heads/$branch" >>"$LOG" 2>&1
 }
 
 attempt=1
-MAX=4
+MAX=6
 while [ "$attempt" -le "$MAX" ]; do
   if try_push; then
     echo "$(stamp) 已推送 $remote/$branch ($(git rev-parse --short HEAD))" >> "$LOG"
     exit 0
   fi
   if [ "$attempt" -lt "$MAX" ]; then
-    echo "$(stamp) 第 $attempt/$MAX 次推送 $remote/$branch 失败，4 秒后重试" >> "$LOG"
-    sleep 4
+    echo "$(stamp) 第 $attempt/$MAX 次推送 $remote/$branch 失败，10 秒后重试" >> "$LOG"
+    sleep 10
   fi
   attempt=$((attempt + 1))
 done
