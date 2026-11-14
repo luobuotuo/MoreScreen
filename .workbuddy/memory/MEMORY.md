@@ -71,8 +71,14 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
   但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
+- **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
+  **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
+  但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
 - **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
 - **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
+- **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
+  **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
+  但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
   但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
