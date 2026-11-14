@@ -66,7 +66,13 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
   `git filter-repo --path tools/ffmpeg --invert-paths` 从历史清除；**重写前历史已备份**
   `D:/app-workbuddy/remote-screen-backup-20261114-1846.bundle`（38MB），旧 SHA 全部失效。
 - **坑 4**：需 `.gitattributes` 固定 `*.sh text eol=lf`，否则 Windows checkout 后 hook 脚本 CRLF 失效。
-- **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
+- **根因（2026-11-14 20:1x 定位）**：hook 里 `git push` 失败并非文件锁，而是 **`GIT_SSH_COMMAND` 触发的二次解析**——
+  git 会用 `sh -c "ssh ..."` 再解析一遍命令，MSYS2 在这一层把 `~/.ssh` 访问路径改写，
+  ssh 遂报 `Load key ...: Permission denied` + `Failed to add the host to the list of known hosts`。
+  而**不设 GIT_SSH_COMMAND 时（git 默认 ssh 调用方式）手动 push 完全正常**。
+  **结论：hook 里不要用 GIT_SSH_COMMAND**，改用默认调用方式；并 `export MSYS2_ARG_CONV_EXCL='*'`、
+  `export MSYS_NO_PATHCONV=1`、把 HOME 规范成 POSIX 形式。
+- **实测结论**：按上述修复后，hook 内直连 ssh 认证成功（`Hi luobuotuo!`），推送恢复可用。
 - **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
@@ -74,7 +80,13 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
   但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
-- **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
+- **根因（2026-11-14 20:1x 定位）**：hook 里 `git push` 失败并非文件锁，而是 **`GIT_SSH_COMMAND` 触发的二次解析**——
+  git 会用 `sh -c "ssh ..."` 再解析一遍命令，MSYS2 在这一层把 `~/.ssh` 访问路径改写，
+  ssh 遂报 `Load key ...: Permission denied` + `Failed to add the host to the list of known hosts`。
+  而**不设 GIT_SSH_COMMAND 时（git 默认 ssh 调用方式）手动 push 完全正常**。
+  **结论：hook 里不要用 GIT_SSH_COMMAND**，改用默认调用方式；并 `export MSYS2_ARG_CONV_EXCL='*'`、
+  `export MSYS_NO_PATHCONV=1`、把 HOME 规范成 POSIX 形式。
+- **实测结论**：按上述修复后，hook 内直连 ssh 认证成功（`Hi luobuotuo!`），推送恢复可用。
 - **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
