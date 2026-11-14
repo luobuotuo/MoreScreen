@@ -1,2 +1,3 @@
-//! Windows 宿主端实现（占位，后续按模块填充）。
+//! Windows 宿主端实现。
+pub mod capture;
 pub mod displays;

@@ -10,6 +10,8 @@ remote-screen-core = { path = "../core" }
 windows = { version = "0.61", default-features = false, features = [
     "Foundation",
     "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, CDS_UPDATEREGISTRY, DEVMODE_FIELD_FLAGS, DEVMODEW,
     DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_PRIMARY_DEVICE, DISPLAY_DEVICEW, DM_DISPLAYFREQUENCY,
     DM_PELSHEIGHT, DM_PELSWIDTH, DM_POSITION, EnumDisplayDevicesW, EnumDisplaySettingsExW,
-    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS,
+    ENUM_CURRENT_SETTINGS, ENUM_DISPLAY_SETTINGS_FLAGS, ENUM_DISPLAY_SETTINGS_MODE,
 };
 
 /// 把 Win32 的 UTF-16 固定缓冲区转成 String（遇 NUL 截断）。
@@ -222,6 +222,53 @@ pub unsafe fn apply_display_mode(
     } else {
         Err(format!("ChangeDisplaySettingsExW 返回 DISP_CHANGE({})", result.0))
     }
+}
+
+/// 列出某显示设备支持的所有模式（只读探测，不改变任何设置）。
+///
+/// 用途：判断虚拟显示适配器在"未连接"状态下是否已经暴露可用模式——
+/// 如果暴露了，说明可以直接用程序把它点亮成扩展屏；如果没有，
+/// 说明必须由驱动客户端（如 Parsec / ToDesk / AskLink 的会话）先建立连接。
+pub unsafe fn list_modes(device_path: &str) -> Vec<DisplayMode> {
+    let mut modes = Vec::new();
+    if device_path.is_empty() {
+        return modes;
+    }
+    let path = to_pcwstr(device_path);
+    let mut index: u32 = 0;
+    loop {
+        let mut dm = DEVMODEW {
+            dmSize: std::mem::size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        let ok = EnumDisplaySettingsExW(
+            PCWSTR(path.as_ptr()),
+            ENUM_DISPLAY_SETTINGS_MODE(index),
+            &mut dm,
+            ENUM_DISPLAY_SETTINGS_FLAGS(0),
+        )
+        .as_bool();
+        if !ok {
+            break;
+        }
+        index += 1;
+        if dm.dmPelsWidth == 0 || dm.dmPelsHeight == 0 {
+            continue;
+        }
+        let mode = DisplayMode {
+            width: dm.dmPelsWidth,
+            height: dm.dmPelsHeight,
+            refresh_hz: dm.dmDisplayFrequency,
+            bits_per_pixel: dm.dmBitsPerPel,
+        };
+        if !modes.iter().any(|m| *m == mode) {
+            modes.push(mode);
+        }
+        if modes.len() > 64 {
+            break;
+        }
+    }
+    modes
 }
 
 /// 生成以 NUL 结尾的 UTF-16 缓冲区。

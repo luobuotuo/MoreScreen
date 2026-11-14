@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>remote-screen 接收端（Stage 4 骨架）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101114; color: #e8eaed; font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  header { padding: 10px 14px; border-bottom: 1px solid #26282e; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .stat { color: #9aa0a6; font-variant-numeric: tabular-nums; }
+  .stat b { color: #8ab4f8; font-weight: 600; }
+  #stage { padding: 24px; }
+  video { width: 100%; height: auto; background: #000; border-radius: 8px; display: block; }
+  .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
+  code { background: #26282e; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>remote-screen 接收端</h1>
+  <span class="stat">状态 <b id="state">未连接</b></span>
+  <span class="stat">帧率 <b id="fps">–</b></span>
+  <span class="stat">分辨率 <b id="res">–</b></span>
+  <span class="stat">丢包 <b id="lost">–</b></span>
+  <span class="stat">抖动缓冲 <b id="jbd">–</b></span>
+  <span class="stat">RTT <b id="rtt">–</b></span>
+</header>
+<div id="stage">
+  <video id="v" autoplay playsinline muted></video>
+  <div class="bar"><i id="bar"></i></div>
+  <p class="stat" style="margin-top:14px">
+    当前为 Stage 4 骨架：已内置 <code>getStats()</code> 采集与 <code>requestVideoFrameCallback</code> 呈现节奏统计。
+    正式链路将使用 WebRTC（<code>RTCPeerConnection</code> + <code>recvonly</code> 视频轨），
+    传输层替换不影响本页的统计与渲染逻辑。
+  </p>
+</div>
+<script>
+// —— 统计与渲染骨架（先于传输实现落地，保证指标口径一致）——
+const el = id => document.getElementById(id);
+const video = el('v');
+let frameTimes = [];
+
+function updateFrameRate(now) {
+  frameTimes.push(now);
+  while (frameTimes.length && now - frameTimes[0] > 2000) frameTimes.shift();
+  const fps = frameTimes.length > 1 ? (frameTimes.length - 1) * 1000 / (now - frameTimes[0]) : 0;
+  el('fps').textContent = fps.toFixed(1);
+  el('bar').style.width = Math.min(100, fps / 60 * 100) + '%';
+}
+
+if (typeof video.requestVideoFrameCallback === 'function') {
+  const onFrame = (now, meta) => {
+    updateFrameRate(now);
+    if (meta && meta.presentedFrames !== undefined) {
+      el('state').textContent = '播放中';
+    }
+    video.requestVideoFrameCallback(onFrame);
+  };
+  video.requestVideoFrameCallback(onFrame);
+}
+
+video.addEventListener('loadedmetadata', () => {
+  el('res').textContent = video.videoWidth + '×' + video.videoHeight;
+});
+
+// 预留：建立 WebRTC 接收端后，用 getStats() 填充丢包/抖动缓冲/RTT
+window.__rsStats = async (pc) => {
+  if (!pc) return;
+  const report = await pc.getStats();
+  report.forEach(s => {
+    if (s.type === 'inbound-rtp' && s.kind === 'video') {
+      el('lost').textContent = s.packetsLost ?? '–';
+      const delay = s.jitterBufferDelay, count = s.jitterBufferEmittedCount;
+      el('jbd').textContent = (delay && count) ? (delay / count * 1000).toFixed(1) + ' ms' : '–';
+    }
+    if (s.type === 'candidate-pair' && s.state === 'succeeded') {
+      el('rtt').textContent = s.currentRoundTripTime != null
+        ? (s.currentRoundTripTime * 1000).toFixed(0) + ' ms' : '–';
+    }
+  });
+};
+</script>
+</body>
+</html>

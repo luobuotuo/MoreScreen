@@ -88,8 +88,102 @@ fn main() {
             assert_eq!(machine.state(), remote_screen_core::SessionState::Connected);
             println!("selftest: OK（状态机走到 connected）");
         }
+        "modes" => {
+            // 只读探测：列出某显示设备支持的模式
+            let displays = enumerate_displays();
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let target = match displays.get(index) {
+                Some(d) => d,
+                None => {
+                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    std::process::exit(2);
+                }
+            };
+            println!("目标: {}  设备 {}", target.label(), target.device_path);
+            let modes = unsafe { remote_screen_host_win::displays::list_modes(&target.device_path) };
+            if modes.is_empty() {
+                println!("  该设备未暴露任何模式（虚拟适配器通常需先由其客户端建立会话）");
+            } else {
+                println!("  可用模式 {} 种，前 12 个：", modes.len());
+                for m in modes.iter().take(12) {
+                    println!("    {}x{}@{}Hz {}bpp", m.width, m.height, m.refresh_hz, m.bits_per_pixel);
+                }
+            }
+        }
+        "capture-probe" => {
+            // 采集探测：抓取指定显示器若干秒，输出帧率与内容尺寸
+            let displays = enumerate_displays();
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    displays
+                        .iter()
+                        .position(|d| d.is_active)
+                        .unwrap_or(0)
+                });
+            let seconds = arg_value(&args, "--seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5);
+            let target = match displays.get(index) {
+                Some(d) => d,
+                None => {
+                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    std::process::exit(2);
+                }
+            };
+            println!("目标: {}", target.label());
+            println!(
+                "  位置=({},{}) 模式={}x{}@{}Hz 虚拟={}",
+                target.bounds.x,
+                target.bounds.y,
+                target.mode.width,
+                target.mode.height,
+                target.mode.refresh_hz,
+                target.is_virtual
+            );
+            match remote_screen_host_win::capture::probe_capture(
+                target.bounds.x,
+                target.bounds.y,
+                target.mode.width,
+                target.mode.height,
+                seconds * 1000,
+            ) {
+                Ok(s) => {
+                    let fps = if s.avg_interval_ms > 0.0 {
+                        1000.0 / s.avg_interval_ms
+                    } else {
+                        0.0
+                    };
+                    println!("采集结果:");
+                    println!("  帧数          = {}", s.frames);
+                    println!("  首帧延迟      = {:.1} ms", s.first_frame_delay_ms);
+                    println!(
+                        "  平均帧间隔    = {:.2} ms (≈ {:.1} fps)",
+                        s.avg_interval_ms, fps
+                    );
+                    println!("  最小/最大间隔 = {:.2} / {:.2} ms", s.min_interval_ms, s.max_interval_ms);
+                    println!("  内容尺寸      = {}x{}", s.content_width, s.content_height);
+                    if s.frames == 0 {
+                        eprintln!("警告: 未捕获到任何帧");
+                        std::process::exit(3);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("采集失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {
-            println!("用法: rs-host <displays [--json] | selftest>");
+            println!("用法: rs-host <displays [--json] | selftest | capture-probe [--index N] [--seconds S]>");
         }
     }
+}
+
+/// 读取 `--key value` 形式的参数值。
+fn arg_value(args: &[String], key: &str) -> Option<String> {
+    let pos = args.iter().position(|a| a == key)?;
+    args.get(pos + 1).cloned()
 }
