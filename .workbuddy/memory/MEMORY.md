@@ -66,3 +66,5 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
   `git filter-repo --path tools/ffmpeg --invert-paths` 从历史清除；**重写前历史已备份**
   `D:/app-workbuddy/remote-screen-backup-20261114-1846.bundle`（38MB），旧 SHA 全部失效。
 - **坑 4**：需 `.gitattributes` 固定 `*.sh text eol=lf`，否则 Windows checkout 后 hook 脚本 CRLF 失效。
+- **实测结论**：加固后（去掉 `-i`、重试 5 次×5 秒）**连续两次提交均一次推送成功**，无需常驻 ssh-agent。
+- **仓库当前为 public**：如需私有，`gh repo edit luobuotuo/MoreScreen --visibility private --accept-visibility-change-consequences`。
