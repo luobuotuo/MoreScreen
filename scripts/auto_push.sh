@@ -62,6 +62,26 @@ export MSYS_NO_PATHCONV=1
 # 任何交互式提示都不允许（防止后台推送卡死）
 export GIT_TERMINAL_PROMPT=0
 
+# ---------------------------------------------------------------------------
+#  恢复用户身份环境变量（**这是能否读 ~/.ssh 的决定性因素**）。
+#  git 在 spawn hook 时会清掉 USER / USERNAME / USERPROFILE 等变量，
+#  而 MSYS2/Cygwin 的 POSIX 权限层依赖它们去解析 NTFS ACL：
+#  身份信息缺失时，ssh 的 fopen("~/.ssh/known_hosts") 会直接返回 EACCES，
+#  表现为 "Permission denied" / "Host key verification failed"，
+#  而同一时刻在普通 shell 里执行完全正常。
+# ---------------------------------------------------------------------------
+if [ -z "${USER:-}" ]; then
+  USER="$(id -un 2>/dev/null || echo "${USERNAME:-unknown}")"
+  export USER
+fi
+export USERNAME="${USERNAME:-$USER}"
+if [ -z "${USERPROFILE:-}" ]; then
+  USERPROFILE="$(cd "$HOME" && pwd -W 2>/dev/null || echo "$HOME")"
+  export USERPROFILE
+fi
+export HOMEDRIVE="${HOMEDRIVE:-C:}"
+export HOMEPATH="${HOMEPATH:-\\Users\\$USERNAME}"
+
 # ---- 每次运行都记录诊断（对比：hook 内直连 ssh vs git push 内的 ssh）----
 {
   echo "=== 诊断 @ $(stamp) ==="
