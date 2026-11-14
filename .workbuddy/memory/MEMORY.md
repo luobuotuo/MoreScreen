@@ -52,3 +52,17 @@ ffmpeg SPS/PPS 只在码流开头出现一次（须缓存补齐关键帧）；`i
 Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传输 simple-peer/WebRTC；
 宿主内嵌 Koa + Socket.IO 做本地信令与静态页托管（`src/server/index.ts`，room id 做 SHA-256，端口占用自动降级）；
 接收端为独立 Vite 静态工程 `src/client-viewer`。**它不自带虚拟显示器**，需外部虚拟显示适配器。
+
+## Git 绑定与自动推送（11-14 18:5x 落地）
+- 远端：`origin` = `git@github.com:luobuotuo/MoreScreen.git`（SSH，已认证 `luobuotuo`），分支 master 跟踪 origin/master。
+- **必须走 SSH**：本机 GitHub HTTPS 直连 443 超时、全局代理 `127.0.0.1:19828` 对 github.com 返回 Empty reply；
+  而 SSH 22/443 均连通，且 SSH 无交互，适合后台自动推送。
+- 自动推送：`scripts/auto_push.sh` 安装为 `.git/hooks/post-commit`；**失败不阻塞提交**，日志 `.git/auto-push.log`；
+  开关 `git config auto-push.enabled false`。clone 后用 `sh scripts/install_hook.sh` 安装。
+- **坑 1**：Git Bash 下 HOME 为 Windows 形式时 known_hosts 路径非法 → `Permission denied` / `Host key verification failed`；
+  hook 内必须把 HOME 转 POSIX（cygpath -u）并显式 `-i ~/.ssh/id_ed25519 -o BatchMode=yes`。
+- **坑 2**：known_hosts 会瞬时文件锁，push 需重试（hook 内重试 3 次 + 兜底忽略 known_hosts）。
+- **坑 3**：`tools/ffmpeg/bin/ffmpeg.exe` 100.54MB 超 GitHub 单文件 100MB 硬限制 → 已用
+  `git filter-repo --path tools/ffmpeg --invert-paths` 从历史清除；**重写前历史已备份**
+  `D:/app-workbuddy/remote-screen-backup-20261114-1846.bundle`（38MB），旧 SHA 全部失效。
+- **坑 4**：需 `.gitattributes` 固定 `*.sh text eol=lf`，否则 Windows checkout 后 hook 脚本 CRLF 失效。
