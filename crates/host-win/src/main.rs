@@ -346,6 +346,72 @@ fn main() {
                 }
             }
         }
+        "vdd-install" => {
+            // 创建 root-enumerated 设备节点并绑定 VDD 驱动（需管理员）
+            let log_path = arg_value(&args, "--log");
+            let inf = arg_value(&args, "--inf")
+                .unwrap_or_else(|| "tools/vdd-driver/VirtualDisplayDriver/MttVDD.inf".to_string());
+            let hw = arg_value(&args, "--hw").unwrap_or_else(|| "Root\\MttVDD".to_string());
+            println!("管理员权限   : {}", remote_screen_host_win::vdd::is_admin());
+            println!("INF          : {}", inf);
+            println!("硬件 ID      : {}", hw);
+            let mut report = String::new();
+            let push = |r: &mut String, line: &str| {
+                r.push_str(line);
+                r.push('\n');
+            };
+            push(&mut report, &format!("管理员权限   : {}", remote_screen_host_win::vdd::is_admin()));
+            push(&mut report, &format!("INF          : {}", inf));
+            push(&mut report, &format!("硬件 ID      : {}", hw));
+
+            let outcome = remote_screen_host_win::vdd::install_vdd_device(
+                std::path::Path::new(&inf),
+                &hw,
+            );
+            let exit_code = match outcome {
+                Ok(r) => {
+                    push(&mut report, &format!("节点原已存在 : {}", r.node_existed));
+                    push(&mut report, &format!("本次创建节点 : {}", r.node_created));
+                    push(&mut report, &format!("驱动绑定成功 : {}", r.driver_bound));
+                    push(&mut report, &format!("需要重启     : {}", r.reboot_required));
+                    push(
+                        &mut report,
+                        &format!(
+                            "实例 ID      : {}",
+                            r.instance_id.clone().unwrap_or_else(|| "(未知)".to_string())
+                        ),
+                    );
+                    for m in &r.messages {
+                        push(&mut report, &format!("  · {}", m));
+                    }
+                    match remote_screen_host_win::vdd::umdf_driver_installed() {
+                        Some((path, len)) => {
+                            push(&mut report, &format!("UMDF 驱动    : {} ({} 字节)", path, len))
+                        }
+                        None => push(
+                            &mut report,
+                            "UMDF 驱动    : 未落地到 System32\\drivers\\UMDF（可能需要重启）",
+                        ),
+                    }
+                    push(&mut report, "下一步：运行 `rs-host displays`，应出现新的 Virtual Display Driver");
+                    0
+                }
+                Err(e) => {
+                    push(&mut report, &format!("VDD 安装失败: {}", e));
+                    1
+                }
+            };
+
+            print!("{}", report);
+            if let Some(path) = log_path {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, report.as_bytes());
+                println!("报告已写入: {}", path);
+            }
+            std::process::exit(exit_code);
+        }
         "capture-probe" => {
             // 采集探测：抓取指定显示器若干秒，输出帧率与内容尺寸
             let displays = enumerate_displays();
@@ -421,7 +487,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe | capture-dump | stream [--index N] [--port P] [--seconds S] [--nv12 file]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe | capture-dump | stream [--index N] [--port P] [--seconds S] [--nv12 file] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
         }
     }
 }

@@ -33,8 +33,17 @@ Stage 0 ✅ / Stage 1 ✅ / Stage 2 ✅（物理主屏 60.1fps、首帧 14ms）/
 / Stage 4 ⚠️ 实时链路已通（采集→编码→WS→浏览器），实测：采集→编码出 **p50 175ms/p95 204ms**、编码→发送 p50 0.11ms、
 主机侧合计 p50 175ms、码率 ~5.0Mbps、访问单元 211/9.2s≈23fps；**瓶颈=CPU 侧 BGRA→NV12 逐像素转换**。
 **浏览器"出画面"在本机无法验证**：Chromium 对 H.264 与 VP8 一律 `EncodingError: Decoding error.`（对照实验=环境问题）。
-**VDD 阻塞点：驱动包已装（DriverStore 有 mttvdd.inf_amd64_…），但设备节点 ROOT\MttVDD 未创建** →
-用 `tools/install_vdd_full.cmd`（管理员终端）创建，或重启后再跑；本机 Parsec/ToDesk/AskLink 适配器无会话时不暴露模式。
+**VDD 节点已建立（11-14 16:4x 实测）**：`rs-host vdd-install`（自研 SetupAPI 工具，`crates/host-win/src/vdd.rs`）
+成功创建 `ROOT\MTTVDD\0000`（状态"已启动"、驱动 oem223.inf、UMDF dll 已落地 251640B），
+`rs-host displays` 可见新条目 `\\.\DISPLAY36 Root\MttVDD`。
+**关键认知：`pnputil /add-driver /install` 永远不会创建 root-enumerated(SWD) 设备节点**，
+必须走 SetupAPI 四步（SetupDiCreateDeviceInfoList → SetupDiCreateDeviceInfo+写 SPDRP_HARDWAREID
+→ DIF_REGISTERDEVICE → UpdateDriverForPlugAndPlayDevices），等价 devcon install 但无需装 WDK。
+**新阻塞：MttVDD.dll 未被任何进程加载**（tasklist /m 无结果），setupapi 报
+`CM_PROB_FAILED_START / 0x8007001f ERROR_NOT_SUPPORTED` → 驱动签名策略拒绝
+（本机 MttVDD 是 SignPath 跨签名，而能工作的第三方 IddCx 驱动是 Microsoft attestation 签名）。
+出路见 `docs/02-vdd-options.md`；**推荐路线 B：启动 ToDesk/Parsec 客户端连一次**
+（本机 Parsec/ToDesk/AskLink 适配器无客户端会话时不暴露模式）。
 未做：BGRA 直喂 ffmpeg / GPU 侧色彩转换、编码背压丢帧、MF 自研编码器、WebRTC、端到端延迟、macOS/Linux、键鼠回传。
 坑位：AU 边界≠VCL 边界（x264 多 slice，须解 first_mb_in_slice）；硬件编码器读写必须解耦否则死锁；
 ffmpeg SPS/PPS 只在码流开头出现一次（须缓存补齐关键帧）；`isConfigSupported` 返回 Promise。

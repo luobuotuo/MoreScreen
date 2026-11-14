@@ -18,6 +18,7 @@ windows = { version = "0.61", default-features = false, features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Gdi",
     "Win32_Media_DxMediaObjects",
     "Win32_Media_MediaFoundation",

@@ -101,3 +101,77 @@ scripts/env.sh      环境变量（proxy 绕过 + CARGO_TARGET_DIR + PATH）
   它会改变用户桌面布局，必须由 UI 显式触发。
 - `display.rs` 的虚拟判定依赖 `ROOT\...` 枚举器这一约定；
   若换用自研驱动，需复核该判定仍然成立。
+
+## 七、VDD 设备节点：已建立（方法与结论）
+
+### 关键认知：`pnputil` 不会创建 root-enumerated 设备节点
+
+`MttVDD.inf` 用的是**软件枚举设备（SWD / root-enumerated）**：
+
+```text
+[Standard.NTamd64]
+%DeviceName%=MyDevice_Install, Root\MttVDD
+```
+
+`pnputil /add-driver xxx.inf /install` 只做两件事：① 把驱动包发布到 DriverStore（生成 `oem223.inf`）；
+② 给**已存在**的匹配设备安装驱动。它**不会凭空创建** root-enumerated 设备节点。
+所以"驱动包装好了但 `ROOT\MttVDD` 查不到设备"是必然结果，不是安装失败。
+
+### 建立节点的唯一正确路径：SetupAPI 四步
+
+| 步骤 | API | 说明 |
+|---|---|---|
+| 1 | `SetupDiCreateDeviceInfoList` | 建设备信息集 |
+| 2 | `SetupDiCreateDeviceInfo` + `SetupDiSetDeviceRegistryProperty(SPDRP_HARDWAREID)` | 创建设备并写硬件 ID |
+| 3 | `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)` | 注册设备 |
+| 4 | `UpdateDriverForPlugAndPlayDevices` | 把驱动绑上去 |
+
+等价于 WDK 的 `devcon install MttVDD.inf Root\MttVDD`，但**不需要安装 WDK**。
+本项目实现于 `crates/host-win/src/vdd.rs`，CLI 为 `rs-host vdd-install`
+（另附 `tools/create_vdd_device.ps1` 免编译版与 `tools/install_vdd_full.cmd` 一键脚本）。
+
+### 踩到的两个真实坑
+
+1. **`SetupDiCreateDeviceInfo` 的 `DeviceName` 不能带反斜杠**。
+   微软文档规定 DeviceName 含 `\` 会被解释为**硬件 ID**，而 `Root\MttVDD` 在 SetupAPI 侧
+   没有对应的已注册 setup class，直接返回 `0xE0000205 (SPAPI_E_NO_SUCH_REGCLASS)`。
+   正确做法：DeviceName 传普通名（`MttVDD`），硬件 ID 另行写入（devcon 也是这么做的）。
+2. **错误码要用 u32**。SetupAPI 的 HRESULT（0xE00002xx）超出 i32 范围，写成 i32 直接编译失败。
+
+### 实测结果（已在本机跑通）
+
+```text
+管理员权限   : true
+节点原已存在 : false
+本次创建节点 : true
+驱动绑定成功 : true
+需要重启     : false
+实例 ID      : ROOT\MTTVDD\0000
+UMDF 驱动    : C:\windows\System32\drivers\UMDF\MttVDD.dll (251640 字节)
+```
+
+`rs-host displays` 中出现新条目（索引 5）：`\\.\DISPLAY36  Root\MttVDD`；
+`pnputil /enum-devices /instanceid "ROOT\MTTVDD\0000"` 显示状态"已启动"、驱动 `oem223.inf`。
+
+### 遗留阻塞：UMDF 驱动加载被系统拒绝
+
+节点与驱动绑定都成功，但 **MttVDD.dll 没有被任何进程加载**（`tasklist /m MttVDD.dll` 无结果），
+setupapi.dev.log 给出明确原因：
+
+```text
+!!!  dvi:  Device not started: Device has problem: 0x0a (CM_PROB_FAILED_START),
+           problem status: 0x8007001f        (= ERROR_NOT_SUPPORTED)
+```
+
+`pnputil /restart-device "ROOT\MTTVDD\0000"` 之后仍失败（错误来自更早的安装段）。
+
+对照事实：
+- 本机 `System32\drivers\UMDF\` 下已运行着多个 IddCx 驱动
+  （`OrayIddDriver.sys` 向日葵、`tdIdd.dll` ToDesk、`RdpIdd.dll`、`MiraDisp.dll`）→ **IddCx + UMDF 通路本身是通的**；
+- `IndirectKmd.sys`（IddCx 内核桥接）存在；
+- HVCI/内存完整性未启用；
+- MttVDD.dll 签名状态 `Valid`，但签发者是 **SignPath Foundation（跨签名）**，
+  而本机那些能工作的第三方 IddCx 驱动用的是 **Microsoft Windows Hardware Compatibility Publisher（attestation）**。
+
+结论：**这不是"节点没建起来"，而是"驱动被驱动签名策略拒绝加载"**。
+四条可选出路见 `docs/02-vdd-options.md`。
