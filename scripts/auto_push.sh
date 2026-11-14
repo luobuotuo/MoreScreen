@@ -33,7 +33,7 @@ fi
 
 # ---------------------------------------------------------------------------
 #  HOME 必须是 POSIX 形式。
-#  Git Bash 的 OpenSSH 在 HOME 为 Windows 形式（C:/Users/...）时会把
+#  Git Bash 的 OpenSSH 在 HOME 为 Windows 形式（C:\Users\...）时会把
 #  known_hosts 拼成非法路径，导致 "Permission denied" / "Host key verification failed"。
 # ---------------------------------------------------------------------------
 if [ -z "${HOME:-}" ]; then
