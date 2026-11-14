@@ -137,6 +137,7 @@ fn main() {
             ) {
                 Ok(s) => {
                     println!("帧数 = {}", s.frames);
+                    println!("内容尺寸 = {}x{}", s.content_width, s.content_height);
                     if let Some(c) = &s.content {
                         println!(
                             "内容自检 = 平均亮度 {:.1} / 峰值 {} / 非黑占比 {:.1}%（{}）",

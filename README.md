@@ -52,7 +52,19 @@ cargo run --release -p remote-screen-host-win -- capture-probe --index 0 --secon
 
 # 受限环境下跑核心断言
 cargo run --release -p remote-screen-core --bin core_selfcheck
+
+# 虚拟屏就绪检测 + 扩展屏采集闭环验证（等待虚拟屏出现后自动采集并导出 PNG）
+python scripts/verify_virtual_screen.py --timeout 180
 ```
+
+### 点亮虚拟屏的两种方式
+
+| 方式 | 原理 | 操作 |
+|---|---|---|
+| **A. 远程连接一次** | ToDesk / Parsec 是**会话型** IddCx 驱动：远端连上时客户端才通过 IddCx 创建显示器，断开即销毁 | 手机/平板装 ToDesk → 输入本机设备代码 → 连上并保持 |
+| **B. 常驻型驱动** | MttVDD 是**常驻型**：`vdd_settings.xml` 里 `<monitors><count>1</count>`，驱动加载即自动建 1 块显示器 | 管理员终端 `bcdedit /set testsigning on` → 重启（SignPath 签名驱动在测试模式下才被允许加载） |
+
+两条路任选其一，随后跑 `python scripts/verify_virtual_screen.py` 即可完成采集闭环验证。
 
 ## 设计要点
 
