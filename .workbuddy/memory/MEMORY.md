@@ -27,18 +27,17 @@
 - **两套 MinGW 并存**（`D:\mingw64x2` 15.2.0 + WinGet WinLibs 16.2.0）：PATH 顺序不可漂移，改动后必须重跑回归。
 - crates 走 rsproxy 稀疏索引（`~/.cargo/config.toml` 已配置）。
 
-## 现状（2026-11-14）
-Stage 0 ✅ / Stage 1 ✅（枚举 24~35 个显示目标，虚拟屏判定可靠）/ Stage 2 ✅（物理主屏实测 60.1fps、首帧 14ms、1920×1080）
-/ Stage 3a ✅（GPU 回读 + 亮度自检 240.8/99.5% + NV12 导出 3,110,400B，肉眼可读）
-/ Stage 3 ✅（H.264 编码：Constrained Baseline yuv420p 1920×1080；访问单元 [SPS,PPS,IDR] 独立解码 6,220,800B 正确）
-/ Stage 4 ⚠️传输已验证（WS 探针收流无损、浏览器端 configure 成功），**但本机 Chromium 视频解码器不可用**
-（H.264 与 VP8 一律 `EncodingError: Decoding error.`；无头模式 frames=0）→ 对照实验证明是环境问题，非码流问题。
-**阻塞点：本机 Parsec/ToDesk/AskLink 虚拟适配器未建会话时不暴露模式 → 已下载静态 VDD(MttVDD 25.7.23)，
-两次 UAC 提权均被拒，驱动未落地；手动命令 `pnputil /add-driver tools\vdd-driver\VirtualDisplayDriver\MttVDD.inf /install`，
-回滚 `pnputil /delete-driver mttvdd.inf /uninstall /force`。**
-未做：MF 自研编码器（现用 ffmpeg 子进程，接口已留）、WebRTC、端到端延迟测量、macOS/Linux、键鼠回传。
-工具源：静态 ffmpeg 走 PyPI 镜像（imageio-ffmpeg）最可靠；winget/gyan/GitHub 直连在本机慢或失败。
-沙箱限制：PowerShell 工具禁止拉起 cmd.exe；提权用 `Start-Process -Verb RunAs` 直接调 pnputil.exe（可能需用户点 UAC）。
+## 现状（2026-11-14 16:10）
+Stage 0 ✅ / Stage 1 ✅ / Stage 2 ✅（物理主屏 60.1fps、首帧 14ms）/ Stage 3a ✅（亮度自检 240.8/99.5% + NV12 导出）
+/ Stage 3 ✅（H.264 硬编：**h264_qsv 实测可用**，编码器自动探测 qsv→nvenc→amf→libx264，RS_ENCODER 可强制）
+/ Stage 4 ⚠️ 实时链路已通（采集→编码→WS→浏览器），实测：采集→编码出 **p50 175ms/p95 204ms**、编码→发送 p50 0.11ms、
+主机侧合计 p50 175ms、码率 ~5.0Mbps、访问单元 211/9.2s≈23fps；**瓶颈=CPU 侧 BGRA→NV12 逐像素转换**。
+**浏览器"出画面"在本机无法验证**：Chromium 对 H.264 与 VP8 一律 `EncodingError: Decoding error.`（对照实验=环境问题）。
+**VDD 阻塞点：驱动包已装（DriverStore 有 mttvdd.inf_amd64_…），但设备节点 ROOT\MttVDD 未创建** →
+用 `tools/install_vdd_full.cmd`（管理员终端）创建，或重启后再跑；本机 Parsec/ToDesk/AskLink 适配器无会话时不暴露模式。
+未做：BGRA 直喂 ffmpeg / GPU 侧色彩转换、编码背压丢帧、MF 自研编码器、WebRTC、端到端延迟、macOS/Linux、键鼠回传。
+坑位：AU 边界≠VCL 边界（x264 多 slice，须解 first_mb_in_slice）；硬件编码器读写必须解耦否则死锁；
+ffmpeg SPS/PPS 只在码流开头出现一次（须缓存补齐关键帧）；`isConfigSupported` 返回 Promise。
 
 ## 参考实现要点（Deskreen CE）
 Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传输 simple-peer/WebRTC；
