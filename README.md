@@ -17,6 +17,7 @@
 | Stage 5 测量 | ⚠️ | 主机侧 p50 175ms / p95 204ms；瓶颈=CPU 侧 BGRA→NV12 转换 |
 | 虚拟屏 | ❌ | VDD 节点已建（`ROOT\MTTVDD\0000`），但驱动被签名策略拒绝加载 |
 
+提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。
 详细进度见 [`docs/01-progress.md`](docs/01-progress.md)，环境基线见 [`docs/00-baseline.md`](docs/00-baseline.md)，
 虚拟屏出路见 [`docs/02-vdd-options.md`](docs/02-vdd-options.md)，Git 工作流见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)。
 
