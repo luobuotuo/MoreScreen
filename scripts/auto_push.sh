@@ -70,8 +70,8 @@ export GIT_TERMINAL_PROMPT=0
   echo "GIT_DIR=${GIT_DIR:-<unset>}"
   echo "GIT_INDEX_FILE=${GIT_INDEX_FILE:-<unset>}"
   echo "PWD=$(pwd)"
-  echo "--- [A] hook 内直连 ssh ---"
-  ssh -o BatchMode=yes -T git@github.com 2>&1 | head -2
+  echo "--- [A] hook 内直连 ssh（-vvv 详细）---"
+  ssh -vvv -o BatchMode=yes -T git@github.com 2>&1 | grep -iE 'known_host|identity file|Permission|denied|open|debug1: Reading|host key' | head -18
   echo "--- [B] git 内 ssh（ls-remote 走远端）---"
   git ls-remote origin HEAD 2>&1 | head -3
   echo "--- [C] 环境变量中的 GIT_* ---"
