@@ -20,7 +20,8 @@
 提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。
 提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。
 详细进度见 [`docs/01-progress.md`](docs/01-progress.md)，环境基线见 [`docs/00-baseline.md`](docs/00-baseline.md)，
-虚拟屏出路见 [`docs/02-vdd-options.md`](docs/02-vdd-options.md)，Git 工作流见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)。
+虚拟屏出路见 [`docs/02-vdd-options.md`](docs/02-vdd-options.md)，Git 工作流见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)，
+**完整项目计划（路线 A：WebRTC）见 [`docs/04-roadmap.md`](docs/04-roadmap.md)**。
 
 ## 目录
 
