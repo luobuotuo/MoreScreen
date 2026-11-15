@@ -106,8 +106,8 @@ fn main() {
             if modes.is_empty() {
                 println!("  该设备未暴露任何模式（虚拟适配器通常需先由其客户端建立会话）");
             } else {
-                println!("  可用模式 {} 种，前 12 个：", modes.len());
-                for m in modes.iter().take(12) {
+                println!("  可用模式 {} 种：", modes.len());
+                for m in modes.iter() {
                     println!("    {}x{}@{}Hz {}bpp", m.width, m.height, m.refresh_hz, m.bits_per_pixel);
                 }
             }
@@ -509,7 +509,7 @@ fn main() {
                 println!("  [{i}] {}", d.label());
             }
             let want = arg_value(&args, "--display");
-            let (index, target) = match pick_display(&displays, index, want.as_deref()) {
+            let (index, target_ref) = match pick_display(&displays, index, want.as_deref()) {
                 Some(v) => v,
                 None => {
                     eprintln!(
@@ -520,6 +520,52 @@ fn main() {
                     std::process::exit(2);
                 }
             };
+            // 取 owned 副本：P2.3 的 --mode 切换后需要用它承载"重新枚举后的新尺寸"
+            let mut target = target_ref.clone();
+            // ---- P2.3 显示模式协商（v1：显式 --mode 触发）----
+            // 按显示目标设备路径切换分辨率/刷新率。**必须显式传入 `--mode` 才执行**，
+            // 默认绝不动用户桌面布局（项目铁律 5）。
+            // 虚拟屏（MttVDD）支持 800x600 ~ 3840x2160、30~165Hz 全档，
+            // 因此可以让它匹配接收端设备，而不是把 800x600 拉伸给平板看。
+            if let Some(spec) = arg_value(&args, "--mode") {
+                let (w, h, hz) = match parse_mode_spec(&spec) {
+                    Some(v) => v,
+                    None => {
+                        eprintln!("--mode 格式应为 WxH[@Hz]，例如 1920x1080@60，收到: {spec}");
+                        std::process::exit(2);
+                    }
+                };
+                println!(
+                    "模式切换    : {} → {w}x{h}@{hz}Hz（显式 --mode 请求）",
+                    target.label()
+                );
+                let r = unsafe {
+                    remote_screen_host_win::displays::apply_display_mode(
+                        &target.device_path,
+                        w,
+                        h,
+                        hz,
+                        target.bounds.x,
+                        target.bounds.y,
+                    )
+                };
+                match r {
+                    Ok(()) => println!("模式切换    : 成功"),
+                    Err(e) => eprintln!("模式切换失败（继续用原模式）: {e}"),
+                }
+                // 等系统应用新模式，然后重新枚举拿到真实生效的尺寸
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                if let Some(t) = enumerate_displays()
+                    .into_iter()
+                    .find(|d| d.device_path == target.device_path)
+                {
+                    target = t;
+                    println!(
+                        "模式切换    : 当前生效 {}x{}@{}Hz",
+                        target.mode.width, target.mode.height, target.mode.refresh_hz
+                    );
+                }
+            }
             // 0x0 的未点亮目标采不出画面：以前会静默退成 16x16 空转，看着像在跑
             if !target.is_active || target.mode.width == 0 || target.mode.height == 0 {
                 eprintln!(
@@ -773,6 +819,20 @@ fn main() {
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     let pos = args.iter().position(|a| a == key)?;
     args.get(pos + 1).cloned()
+}
+
+/// 解析 `--mode` 参数：`WxH@Hz` 或 `WxH`（省略刷新率则用 60Hz）。
+///
+/// 例：`1920x1080@60`、`1280x720`、`2560x1440@120`。
+fn parse_mode_spec(s: &str) -> Option<(u32, u32, u32)> {
+    let (res_part, hz) = match s.split_once('@') {
+        Some((r, h)) => (r, h.trim().parse::<u32>().ok()?),
+        None => (s, 60),
+    };
+    let (w, h) = res_part
+        .split_once('x')
+        .or_else(|| res_part.split_once('X'))?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?, hz))
 }
 
 /// 按**稳定身份**选屏，不要只靠下标：显示器枚举顺序会随插拔/驱动重载漂移

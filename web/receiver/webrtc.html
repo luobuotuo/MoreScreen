@@ -20,6 +20,18 @@
           background: #26282e; color: #e8eaed; border: 0; border-radius: 8px; }
   /* 1:1 原始尺寸模式：不做任何缩放，用于排除非整数倍缩放带来的采样抖动 */
   video.native { width: auto !important; height: auto !important; max-width: none; }
+  /* 全屏沉浸：只留画面，其余 UI 全部隐藏 */
+  #stage:fullscreen { padding: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+  #stage:fullscreen video { width: auto; height: 100vh; max-width: 100vw; border-radius: 0; }
+  #stage:fullscreen #start,
+  #stage:fullscreen .tool,
+  #stage:fullscreen .bar,
+  #stage:fullscreen #log { display: none !important; }
+  /* 全屏时浮一个极小的退出按钮（触摸即可，不干扰观感） */
+  #exitfs { display: none; position: fixed; top: 8px; right: 8px; z-index: 9;
+            padding: 6px 10px; font-size: 12px; background: rgba(0,0,0,.45); color: #cfd3d8;
+            border: 1px solid rgba(255,255,255,.18); border-radius: 6px; }
+  #stage:fullscreen #exitfs { display: block; }
   .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
   .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
   #log { margin-top: 12px; color: #9aa0a6; font-size: 12px; white-space: pre-wrap; max-height: 30vh; overflow: auto; }
@@ -45,6 +57,8 @@
   <video id="v" playsinline webkit-playsinline muted autoplay></video>
   <button id="start">点击开始接收</button>
   <button id="native" class="tool">1:1 原始尺寸</button>
+  <button id="fs" class="tool">进入全屏</button>
+  <button id="exitfs">退出全屏</button>
   <div class="bar"><i id="bar"></i></div>
   <div id="log"></div>
 </div>
@@ -270,8 +284,65 @@ el('start').addEventListener('click', () => {
   tStart = performance.now();
   el('start').style.display = 'none';
   el('native').style.display = 'block';
+  el('fs').style.display = 'block';
   L('用户已确认开始接收');
   connectSignaling();
+  // 必须在用户手势的同一个调用栈里请求全屏，否则会被浏览器拒绝
+  enterImmersive();
+});
+
+// ---- 全屏 + 屏幕常亮（P2.2）----
+// 副屏场景的两条刚需：隐藏浏览器 UI（地址栏占掉一大块）、阻止平板自动息屏。
+let wakeLock = null;
+
+async function enterImmersive() {
+  const stage = el('stage');
+  if (!document.fullscreenElement) {
+    try {
+      // navigationUI 部分内核不支持，失败时用无参版本再试一次
+      await stage.requestFullscreen({ navigationUI: 'hide' });
+    } catch (e1) {
+      try {
+        await stage.requestFullscreen();
+      } catch (e2) {
+        L('全屏请求被拒: ' + (e2.message || e2));
+      }
+    }
+  }
+  await acquireWakeLock();
+}
+
+async function acquireWakeLock() {
+  if (!('wakeLock' in navigator)) {
+    L('此内核不支持 Wake Lock（可能仍会自动息屏）');
+    return;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    L('屏幕常亮已启用');
+    wakeLock.addEventListener('release', () => {
+      // 释放通常是页面切后台导致的，切回来会重新申请
+      L('屏幕常亮已释放');
+    });
+  } catch (e) {
+    L('屏幕常亮申请失败: ' + (e.message || e));
+  }
+}
+
+el('fs').addEventListener('click', enterImmersive);
+el('exitfs').addEventListener('click', async () => {
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+  } catch (e) { /* 忽略 */ }
+});
+
+// 页面从后台切回可见时，Wake Lock 会被系统自动释放，需要重新申请；
+// 顺带把全屏也恢复（部分内核退出后台会退出全屏）。
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (!wakeLock || wakeLock.released) {
+    acquireWakeLock();
+  }
 });
 
 // 1:1 原始尺寸切换：排除「非整数倍缩放」导致的运动采样抖动。
