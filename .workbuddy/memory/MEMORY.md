@@ -118,3 +118,14 @@ Electron + React + TS + electron-vite；桌面捕获走 `desktopCapturer`；传�
 - **本机环境特性**：Bash 工具命令在触发沙箱升级（输出出现 `Sandbox bypassed (escalation-approved)`）时
   **可能被执行两遍**。含 `git commit` 的命令因此会产生成对的同信息提交（内容递进、幂等，不算错误提交，
   但历史不干净）。**含提交的操作后必须用 `git log --oneline` 复查一次**，必要时手工整理。
+
+## WebRTC 传输层（路线 A，11-15 定）
+- **选型 webrtc-rs**（pion 移植，tokio async），非 str0m：因后续要做公网远程，其 TURN 实现更成熟。
+- **P1.1 五项验证全通过**（本机实测）：构建通过（含 turn 0.9.0）；H264Payloader 自动
+  STAP-A(带 SPS/PPS)+FU-A 且吃 Annex B 输入 → **packetization 免自研**；
+  线程桥接（sync_channel(2) + current_thread 运行时）可行 → **无需异步化改造**；
+  QSV 输出 Constrained Baseline = 42e01f，设备支持。
+- **架构铁律（新增）**：必须"外部硬编(QSV) + 仅 RTP 打包"，绝不让 WebRTC 栈自己编码，
+  否则丢掉 7.57ms 优势。
+- 验证资产：`crates/host-win/src/h264probe.rs` + `examples/verify_h264.rs` + `examples/bridge_thread.rs`。
+- 完整结论见 `docs/05-decision-webrtc-rs.md`，计划见 `docs/04-roadmap.md`。

@@ -15,7 +15,7 @@
 | 主机端 | 先 Windows，后 macOS / Linux | 用户基数 + IddCx 通路本机已验证 |
 | 接收端 | **浏览器（WebRTC + `<video>`）** | 华为平板诊断页实测：WebRTC 收发 H.264 全绿、`<video>` 实际播放成功；原生 Android 已排除 |
 | 编码 | **外部硬编（QSV）+ RTP 打包**，不让 WebRTC 栈编码 | 保住已实测的主机侧 7.57ms 优势 |
-| WebRTC 实现 | **str0m（纯 Rust）** | 无 C++ 依赖；支持自定义视频样本输入；与我们 Rust Core 同构 |
+| WebRTC 实现 | **webrtc-rs**（pion/webrtc 的 Rust 移植，tokio async） | 后续要做公网远程，其 STUN/TURN 实现更成熟、pion 生态案例可借鉴；选型依据见 [05-decision-webrtc-rs.md](05-decision-webrtc-rs.md) |
 | 网络 | 局域网优先，无 STUN/TURN（host candidate only） | Deskreen `iceServers: []` 同款；首版不做公网穿透 |
 | 授权 | 自有代码 MIT OR Apache-2.0；**不复制 AGPL 代码** | Deskreen CE 为 AGPL-3.0，重写而非复制 |
 
@@ -54,7 +54,7 @@
 
 | 阶段 | 目标 | 预估工期 | 退出条件 |
 |---|---|---|---|
-| **P1** WebRTC 传输改造 | 把裸 WS 换成 str0m + `<video>` | 4 周 | 华为平板稳定出画面，端到端延迟可测 |
+| **P1** WebRTC 传输改造 | 把裸 WS 换成 webrtc-rs + `<video>` | 4 周 | 华为平板稳定出画面，端到端延迟可测 |
 | **P2** 接收端与交互 | 画质协商、全屏、键鼠回传 | 2~3 周 | 可用作日常副屏 |
 | **P3** 产品化工程 | 安装包、诊断页、崩溃恢复、自动更新 | 3~4 周 | 非开发者可安装使用 |
 | **P4** 平台与多屏 | 双虚拟屏、macOS 适配 | 4~6 周 | 两块屏独立会话跑通 |
@@ -68,12 +68,16 @@
 
 ### P1.1 技术验证（第 1 周）— 先证伪再投入
 
-| # | 任务 | 产出 | 验收标准 |
-|---|---|---|---|
-| P1.1.1 | str0m 在本机构建验证（windows-gnu 宿主） | 可编译的最小 crate | `cargo build` 通过，无 C++ 依赖引入 |
-| P1.1.2 | str0m 能否接受**外部 H.264 样本**（非内置编码） | 概念验证代码 | 把 ffmpeg 产出的 Annex B AU 送入 str0m 视频轨 |
-| P1.1.3 | H.264 RTP packetization 自研（STAP-A / FU-A） | `rtp_h264.rs` | 浏览器能收到并解出 SPS/PPS/IDR |
-| P1.1.4 | SDP 协商：确认 QSV 输出 profile 与设备支持匹配 | SDP 样例 + 文档 | `profile-level-id` 一致，`a=fmtp` 正确 |
+| # | 任务 | 产出 | 验收标准 | 状态 |
+|---|---|---|---|---|
+| P1.1.1 | **webrtc-rs 在本机构建验证（windows-gnu + rsproxy）** | 可编译的最小 crate | `cargo build` 通过 | ✅ 2m21s 通过，`turn 0.9.0` 在依赖链 |
+| P1.1.2 | 外部 H.264 样本兼容性 | `h264probe.rs` + 验证程序 | AU 能被正确 payload | ✅ STAP-A 自动带 SPS/PPS + FU-A，往返一致 |
+| P1.1.3 | **线程桥接验证** | `bridge_thread.rs` | 不破坏 7.57ms 同步链路 | ✅ sync_channel(2) + current_thread 运行时 |
+| P1.1.4 | ~~H.264 RTP packetization 自研~~ | — | — | ✅ **取消**：`H264Payloader` 已实现，见 [05-decision-webrtc-rs.md](05-decision-webrtc-rs.md) |
+| P1.1.5 | SDP profile 核对 | 文档 | `profile-level-id` 一致 | ✅ Constrained Baseline = `42e01f`，设备支持 |
+
+> P1.1 完整结论与两个超预期收获（packetization 免自研、无需异步化）见
+> [`05-decision-webrtc-rs.md`](05-decision-webrtc-rs.md)。
 
 ⚠️ **P1.1.5 用户参与**：本机 Chromium 解码器不可用（H.264/VP8 均报 `Decoding error.`），W1 的浏览器端验证**必须在华为平板或另一台正常机器上做**。
 
@@ -82,7 +86,7 @@
 | # | 任务 | 产出 | 验收标准 |
 |---|---|---|---|
 | P1.2.1 | 信令层：在现有 WS Hub 上加 `offer`/`answer`/`candidate` 三类 JSON 消息 | `serve.rs` 扩展 | 两端 SDP 与 candidate 正常交换 |
-| P1.2.2 | str0m 会话管理：创建 PeerConnection、ICE host candidate 收集 | `webrtc.rs` | 不配 STUN/TURN，局域网可连通 |
+| P1.2.2 | webrtc-rs 会话管理：创建 PeerConnection、ICE host candidate 收集 | `webrtc.rs` | 不配 STUN/TURN，局域网可连通 |
 | P1.2.3 | 接收端改造：WebCodecs → `<video srcObject>` | 新 `index.html` | 平板能出画面 |
 | P1.2.4 | 保留原 WS+WebCodecs 路径作为对照（可开关） | `RS_TRANSPORT` 环境变量 | 便于回归对比 |
 
@@ -90,7 +94,7 @@
 
 | # | 任务 | 产出 | 验收标准 |
 |---|---|---|---|
-| P1.3.1 | WGC → QSV → str0m 全链路串联（替换裸 WS） | 实时链路 | 物理主屏 1080p 连续推流 |
+| P1.3.1 | WGC → QSV → **webrtc-rs** 全链路串联（替换裸 WS），含线程桥接 | 实时链路 | 物理主屏 1080p 连续推流 |
 | P1.3.2 | 虚拟屏接入（ToDeskIddDriver 已点亮） | 虚拟屏推流 | 采集的是虚拟屏而非主屏 |
 | P1.3.3 | 保留背压丢帧与分段指标 | `metrics.jsonl` | 主机侧各段耗时仍可归因 |
 | P1.3.4 | DTLS-SRTP 握手与丢包重传验证 | 抓包 + 日志 | 弱网下不崩、可恢复 |
@@ -170,14 +174,15 @@
 
 | # | 风险 | 概率 | 影响 | 缓解措施 |
 |---|---|---|---|---|
-| R1 | str0m 的 H.264 RTP packetization 自研受阻 | 中 | 高 | P1.1 先做技术验证；退路 webrtc-rs |
-| R2 | str0m 生态新，问题案例少 | 中 | 中 | 提前读源码与测试；保持接口抽象便于换实现 |
-| R3 | QSV 输出 profile 与浏览器不匹配 | 低 | 中 | P1.1.4 先核对；必要时转码一层 |
-| R4 | 本机 Chromium 不可用，前端调试效率低 | **高** | 中 | 固定华为平板为主力验证设备；诊断页常驻 |
-| R5 | 虚拟屏驱动路线未定 | 中 | 高 | P3.3 前必须决策（见下） |
-| R6 | macOS 私有 API（CGVirtualDisplay）变动 | 中 | 高 | 版本锁定 + 适配层隔离 + 不把发布承诺押在其上 |
-| R7 | 单人开发周期滑期 | 高 | 中 | 严格按阶段退出条件推进，不提前做外围功能 |
-| R8 | 平板 DPR 等设备信息异常导致布局错误 | 中 | 低 | 一律用 CSS 尺寸布局，物理像素仅用于能力判断 |
+| R1 | ~~webrtc-rs 构建失败~~ | — | — | ✅ 已排除（P1.1 实测通过） |
+| R2 | ~~H.264 packetization 自研受阻~~ | — | — | ✅ 已排除（`H264Payloader` 内置实现，实测兼容） |
+| R3 | webrtc-rs 实际建连失败（SDP/ICE 协商） | 中 | 高 | P1.2 优先验证；保留 `RS_TRANSPORT` 开关可回退到 WS |
+| R4 | QSV 输出 profile 与浏览器不匹配 | 低 | 中 | P1.1.4 先核对；必要时转码一层 |
+| R5 | 本机 Chromium 不可用，前端调试效率低 | **高** | 中 | 固定华为平板为主力验证设备；诊断页常驻 |
+| R6 | 虚拟屏驱动路线未定 | 中 | 高 | P3.3 前必须决策（见下） |
+| R7 | macOS 私有 API（CGVirtualDisplay）变动 | 中 | 高 | 版本锁定 + 适配层隔离 + 不把发布承诺押在其上 |
+| R8 | 单人开发周期滑期 | 高 | 中 | 严格按阶段退出条件推进，不提前做外围功能 |
+| R9 | 平板 DPR 等设备信息异常导致布局错误 | 中 | 低 | 一律用 CSS 尺寸布局，物理像素仅用于能力判断 |
 
 ---
 
@@ -189,7 +194,7 @@
 | D2 | 开发节奏 | 单人全职 / 兼职 / 增加人力 | 影响全部工期估算 | 立即 |
 | D3 | 主要验证设备 | 华为平板（已诊断可用）/ 另购 iPad | 建议沿用华为平板，成本零 | P1.1.5 |
 | D4 | 是否接受 AGPL 双许可 | 是 / 否 | 否（当前默认）——意味着 Deskreen 代码只能参考不能复制 | 立即（已按"否"执行） |
-| D5 | 首版是否含公网远程 | 否（当前默认）/ 是 | 否——加了就要做 TURN 中继与账号体系，工期翻倍 | P5 前 |
+| D5 | ~~首版是否含公网远程~~ | **已定：后续要做公网远程** | 因此 WebRTC 选型由 str0m 改为 webrtc-rs（见 [05-decision-webrtc-rs.md](05-decision-webrtc-rs.md)）；TURN 中继与账号体系在 P4/P5 增量引入 | 已决策 |
 
 ---
 
@@ -209,11 +214,12 @@
 
 ## 十二、下一步（即刻可执行）
 
-**P1.1 技术验证四件事**，全部在本机完成、不依赖平板：
+**P1.1 技术验证五件事**，全部在本机完成、不依赖平板：
 
-1. str0m 在本机构建（windows-gnu + rsproxy 镜像）
-2. str0m 接受外部 H.264 Annex B 样本的概念验证
-3. H.264 RTP packetization（STAP-A/FU-A + `packetization-mode=1`）
-4. 核对 QSV 输出 profile 与华为平板支持的三种 profile（42e01f / 4d001f / 64001f）
+1. **webrtc-rs 在本机构建**（windows-gnu + rsproxy）——新选型的最大未知数，优先做
+2. webrtc-rs 接受外部 H.264 Annex B 样本的概念验证
+3. 线程桥接：同步采集/编码管线 → tokio 任务（不破坏 7.57ms 链路）
+4. H.264 RTP packetization（STAP-A/FU-A + `packetization-mode=1`）
+5. 核对 QSV 输出 profile 与华为平板支持的三种 profile（42e01f / 4d001f / 64001f）
 
 这四件事做完，路线 A 的技术风险就基本清零，再进入 P1.2 的完整闭环。

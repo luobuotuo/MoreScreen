@@ -8,6 +8,11 @@ description = "Windows 宿主端：显示枚举 / WGC 采集 / Media Foundation 
 [dependencies]
 remote-screen-core = { path = "../core" }
 tungstenite = "0.21"
+# ---- P1.1 WebRTC 传输层（路线 A）----
+webrtc = "0.12"          # WebRTC 栈（pion 移植）：ICE/DTLS/SRTP/TURN/DataChannel
+rtp = "0.12"             # RTP 层：H264Payloader 自动做 STAP-A + FU-A
+bytes = "1"              # webrtc/rtp 的 Bytes 类型
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 windows = { version = "0.61", default-features = false, features = [
     "Foundation",
     "Graphics_Capture",

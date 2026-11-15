@@ -14,12 +14,14 @@
 | Stage 2 采集 | ✅ | WGC+D3D11 60.1fps、首帧 14.1ms、亮度自检 240.8/99.5% |
 | Stage 3 编码 | ✅ | H.264 Constrained Baseline 1920×1080，`h264_qsv` 硬编可用 |
 | Stage 4 传输 | ✅ | WebSocket 广播 + 浏览器解码器配置成功；AU `[SPS,PPS,IDR]` 可独立解码 |
+| P1.1 WebRTC 技术验证 | ✅ | webrtc-rs 构建通过；H264Payloader 自动 STAP-A+FU-A（免自研）；线程桥接可行；profile 匹配 |
 | Stage 5 测量 | ✅ | 主机侧 **p50 7.57ms / p95 20ms**（背压丢帧保延迟）；真实单帧编码 ~7ms |
 | 虚拟屏采集 | ✅ | ToDeskIddDriver 创建 800×600@60 虚拟屏（位置 1920,0），采集 358 帧/60.0fps、非黑占比 100%、NV12 720,000B，导出帧肉眼可读 |
 
 提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。
 提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。
 详细进度见 [`docs/01-progress.md`](docs/01-progress.md)，环境基线见 [`docs/00-baseline.md`](docs/00-baseline.md)，
+WebRTC 传输层选型 **webrtc-rs**（见 [`docs/05-decision-webrtc-rs.md`](docs/05-decision-webrtc-rs.md)）。
 虚拟屏出路见 [`docs/02-vdd-options.md`](docs/02-vdd-options.md)，Git 工作流见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)，
 **完整项目计划（路线 A：WebRTC）见 [`docs/04-roadmap.md`](docs/04-roadmap.md)**。
 
