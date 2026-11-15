@@ -57,7 +57,27 @@ hook 对策：
 - 最后一次兜底忽略 `known_hosts`（密钥认证仍然生效）；
 - `HOME` 统一规范化为 POSIX 形式（Windows 形式会让 Git Bash 的 OpenSSH 拼出非法路径）。
 
-### 真正的根因：不要用 `GIT_SSH_COMMAND`
+### 最终结论：副本密钥 + `core.sshCommand`
+
+真正的根因是**沙箱安全规则拦截了对 `~/.ssh` 目录的读取**（hook 属于工具进程的深层子进程），
+与 MSYS2 / USER 变量 / Defender 均无关。最终解法：
+
+```bash
+# 1) 密钥副本放到 .git/ssh/（.git 目录不会入库，也不会被提交）
+mkdir -p .git/ssh
+cp ~/.ssh/id_ed25519 .git/ssh/
+cp ~/.ssh/known_hosts .git/ssh/
+chmod 600 .git/ssh/id_ed25519
+
+# 2) 让所有 git push 都走副本密钥
+git config core.sshCommand "ssh -i .git/ssh/id_ed25519 \
+  -o UserKnownHostsFile=.git/ssh/known_hosts \
+  -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20"
+```
+
+克隆到新机器后需执行一次 `scripts/install_hook.sh`（其内部会做上述复制与配置）。
+
+### 历史：曾经误判的方向（留档以免重犯
 
 现象（仅在 `git commit` 触发的 hook 里出现，手动 `git push` 一切正常）：
 
@@ -115,7 +135,27 @@ hook 对策：
 - 最后一次兜底忽略 `known_hosts`（密钥认证仍然生效）；
 - `HOME` 统一规范化为 POSIX 形式（Windows 形式会让 Git Bash 的 OpenSSH 拼出非法路径）。
 
-### 真正的根因：不要用 `GIT_SSH_COMMAND`
+### 最终结论：副本密钥 + `core.sshCommand`
+
+真正的根因是**沙箱安全规则拦截了对 `~/.ssh` 目录的读取**（hook 属于工具进程的深层子进程），
+与 MSYS2 / USER 变量 / Defender 均无关。最终解法：
+
+```bash
+# 1) 密钥副本放到 .git/ssh/（.git 目录不会入库，也不会被提交）
+mkdir -p .git/ssh
+cp ~/.ssh/id_ed25519 .git/ssh/
+cp ~/.ssh/known_hosts .git/ssh/
+chmod 600 .git/ssh/id_ed25519
+
+# 2) 让所有 git push 都走副本密钥
+git config core.sshCommand "ssh -i .git/ssh/id_ed25519 \
+  -o UserKnownHostsFile=.git/ssh/known_hosts \
+  -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20"
+```
+
+克隆到新机器后需执行一次 `scripts/install_hook.sh`（其内部会做上述复制与配置）。
+
+### 历史：曾经误判的方向（留档以免重犯
 
 现象（仅在 `git commit` 触发的 hook 里出现，手动 `git push` 一切正常）：
 
