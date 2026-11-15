@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use crate::readback::{analyze_surface, FrameContent};
+use crate::readback::{analyze_surface, read_surface_bgra, FrameContent};
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
@@ -45,6 +45,10 @@ pub struct CaptureStats {
     pub min_interval_ms: f64,
     /// 首帧内容自检（亮度）
     pub content: Option<FrameContent>,
+    /// 实时链路的平均亮度（抽样）
+    pub luma_avg: f64,
+    /// 实时链路的非黑占比（抽样）
+    pub non_black_ratio: f64,
     /// 导出的 NV12 帧路径（若请求）
     pub nv12_path: Option<String>,
 }
@@ -176,9 +180,14 @@ pub fn probe_capture(
                     if stats.content.is_none() {
                         if let Ok(surface) = frame.Surface() {
                             let want_nv12 = dump_nv12.is_some();
-                            if let Ok((content, nv12)) =
-                                analyze_surface(&d3d_device, &d3d_context, &surface, 4, want_nv12)
-                            {
+                            if let Ok((content, nv12, _bgra)) = analyze_surface(
+                                &d3d_device,
+                                &d3d_context,
+                                &surface,
+                                4,
+                                want_nv12,
+                                false,
+                            ) {
                                 stats.content = Some(content);
                                 if let (Some(path), Some(buf)) = (dump_nv12, nv12) {
                                     if let Some(parent) = path.parent() {
@@ -206,10 +215,11 @@ pub fn probe_capture(
 }
 
 
-/// 实时采集并把每帧转成 NV12 交给回调（供编码器消费）。
+/// 实时采集并把每帧的 **BGRA 原始像素**交给回调（供编码器消费）。
 ///
-/// 与 `probe_capture` 的区别：本函数每帧都做回读与色彩转换，
+/// 与 `probe_capture` 的区别：本函数每帧都做回读，并附带亮度抽样统计，
 /// 因此可以真正做到"采集 → 编码"连续流式处理。
+/// **不在 Rust 侧做 BGRA→NV12 转换**——那曾是 175ms 的瓶颈，现由 ffmpeg SIMD 完成。
 pub fn capture_stream<F>(
     bounds_x: i32,
     bounds_y: i32,
@@ -295,11 +305,16 @@ where
                         }
                     }
                     if let Ok(surface) = frame.Surface() {
-                        let (_, nv12) = analyze_surface(&d3d_device, &d3d_context, &surface, 16, true)?;
-                        if let Some(buf) = nv12 {
-                            last_push = Some(now);
-                            on_frame(&buf)?;
+                        // BGRA 直出：色彩转换交给 ffmpeg 的 SIMD 路径，
+                        // 这里只做回读 + 亮度抽样统计。
+                        let (content, bgra) =
+                            read_surface_bgra(&d3d_device, &d3d_context, &surface, 16)?;
+                        if content.sampled > 0 {
+                            stats.luma_avg = content.luma_avg;
+                            stats.non_black_ratio = content.non_black_ratio;
                         }
+                        last_push = Some(now);
+                        on_frame(&bgra)?;
                     }
                 }
                 Err(_) => {

@@ -14,7 +14,7 @@
 | Stage 2 采集 | ✅ | WGC+D3D11 60.1fps、首帧 14.1ms、亮度自检 240.8/99.5% |
 | Stage 3 编码 | ✅ | H.264 Constrained Baseline 1920×1080，`h264_qsv` 硬编可用 |
 | Stage 4 传输 | ✅ | WebSocket 广播 + 浏览器解码器配置成功；AU `[SPS,PPS,IDR]` 可独立解码 |
-| Stage 5 测量 | ⚠️ | 主机侧 p50 175ms / p95 204ms；瓶颈=CPU 侧 BGRA→NV12 转换 |
+| Stage 5 测量 | ✅ | 主机侧 **p50 7.57ms / p95 20ms**（背压丢帧保延迟）；真实单帧编码 ~7ms |
 | 虚拟屏采集 | ✅ | ToDeskIddDriver 创建 800×600@60 虚拟屏（位置 1920,0），采集 358 帧/60.0fps、非黑占比 100%、NV12 720,000B，导出帧肉眼可读 |
 
 提交会自动推送到 GitHub（见 [`docs/03-git-workflow.md`](docs/03-git-workflow.md)）。

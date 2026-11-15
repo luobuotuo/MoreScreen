@@ -8,7 +8,7 @@
 //! 数据流：NV12 帧 → ffmpeg stdin → H.264 (Annex B) stdout → 访问单元切分。
 
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 /// 一次编码会话的输出：若干个 Annex B 访问单元。
 pub type AccessUnit = Vec<u8>;
@@ -23,7 +23,11 @@ pub struct FrameChunk {
 /// 基于 ffmpeg 子进程的 H.264 编码器。
 pub struct FfmpegEncoder {
     child: Child,
-    stdin: Option<ChildStdin>,
+    /// 送帧通道：独立写线程负责阻塞写 ffmpeg stdin，主循环只做非阻塞发送。
+    /// 否则 1080p BGRA 每帧 8.3MB 的管道写入会把采集循环堵死。
+    frame_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// 写线程句柄（结束时要等它把残余帧写完）
+    writer: Option<std::thread::JoinHandle<()>>,
     /// 编码输出通道：独立读线程持续读取 ffmpeg stdout，主循环只做非阻塞收取。
     ///
     /// 必须解耦：硬件编码器（如 QSV async_depth=1）常常"等到下一帧才吐数据"，
@@ -31,7 +35,9 @@ pub struct FfmpegEncoder {
     rx: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
     /// 累积的 Annex B 字节缓冲（等待切分成访问单元）
     pending: Vec<u8>,
-    /// 单帧 NV12 的期望字节数
+    /// 输入像素格式（bgra / nv12）
+    pix_fmt: String,
+    /// 单帧的期望字节数
     expected_len: usize,
     /// 最近一次看到的 SPS（NAL type 7）
     sps: Option<Vec<u8>>,
@@ -48,6 +54,8 @@ pub struct FfmpegEncoder {
 pub struct EncodeConfig {
     pub width: u32,
     pub height: u32,
+    /// 输入像素格式："bgra"（默认，由 ffmpeg SIMD 转 NV12）或 "nv12"
+    pub pix_fmt: String,
     pub fps: u32,
     pub bitrate_kbps: u32,
     /// 是否强制关键帧间隔（帧数）
@@ -56,7 +64,7 @@ pub struct EncodeConfig {
 
 impl Default for EncodeConfig {
     fn default() -> Self {
-        Self { width: 1920, height: 1080, fps: 30, bitrate_kbps: 6000, gop: 30 }
+        Self { width: 1920, height: 1080, fps: 30, bitrate_kbps: 6000, gop: 30, pix_fmt: "bgra".into() }
     }
 }
 
@@ -114,7 +122,7 @@ impl FfmpegEncoder {
             "-f".into(),
             "rawvideo".into(),
             "-pix_fmt".into(),
-            "nv12".into(),
+            cfg.pix_fmt.clone(),
             "-s".into(),
             format!("{}x{}", cfg.width, cfg.height),
             "-r".into(),
@@ -178,9 +186,9 @@ impl FfmpegEncoder {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("启动 ffmpeg 失败（{ffmpeg_path}）: {e}"))?;
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take();
         let stdout = child.stdout.take();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (rtx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
         if let Some(mut out) = stdout {
             std::thread::spawn(move || {
                 let mut buf = [0u8; 64 * 1024];
@@ -188,7 +196,7 @@ impl FfmpegEncoder {
                     match out.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
-                            if tx.send(buf[..n].to_vec()).is_err() {
+                            if rtx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
                         }
@@ -197,12 +205,32 @@ impl FfmpegEncoder {
                 }
             });
         }
+        // 写线程：独占 stdin，把帧数据阻塞写入 ffmpeg
+        // 有界通道：容量 2 帧。满了就丢弃新帧而不是无限排队，
+        // 否则延迟会随时间持续增长（实测无界时 p50 达 872ms）。
+        let (ftx, frx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let writer = stdin.take().map(|mut si| {
+            std::thread::spawn(move || {
+                while let Ok(buf) = frx.recv() {
+                    if si.write_all(&buf).is_err() {
+                        break;
+                    }
+                }
+                // 通道关闭即输入结束，drop stdin 让 ffmpeg flush
+            })
+        });
         Ok(Self {
             child,
-            stdin,
+            frame_tx: Some(ftx),
+            writer,
             rx: Some(rx),
             pending: Vec::new(),
-            expected_len: (cfg.width as usize) * (cfg.height as usize) * 3 / 2,
+            pix_fmt: cfg.pix_fmt.clone(),
+            expected_len: if cfg.pix_fmt == "nv12" {
+                (cfg.width as usize) * (cfg.height as usize) * 3 / 2
+            } else {
+                (cfg.width as usize) * (cfg.height as usize) * 4
+            },
             sps: None,
             pps: None,
             units_emitted: 0,
@@ -210,30 +238,39 @@ impl FfmpegEncoder {
         })
     }
 
-    /// 写入一帧 NV12。
-    pub fn push_nv12(&mut self, frame: &[u8]) -> Result<(), String> {
+    /// 写入一帧原始像素（BGRA 或 NV12，取决于启动时的 pix_fmt）。
+    ///
+    /// 非阻塞：只把数据送进通道，由独立写线程负责写 ffmpeg stdin。
+    /// 返回 `Ok(true)` 表示已入队，`Ok(false)` 表示**因背压被丢弃**
+    /// （编码器消费不过来时主动丢帧，避免延迟无限增长）。
+    pub fn push_frame(&mut self, frame: &[u8]) -> Result<bool, String> {
         let expected = self.self_expected_len();
         if frame.len() != expected {
             return Err(format!(
-                "NV12 长度不符：期望 {}，实际 {}",
+                "帧长度不符（{}）：期望 {}，实际 {}",
+                self.pix_fmt,
                 expected,
                 frame.len()
             ));
         }
-        if let Some(stdin) = self.stdin.as_mut() {
-            stdin
-                .write_all(frame)
-                .map_err(|e| format!("写 ffmpeg stdin 失败: {e}"))?;
-            self.frames_pushed += 1;
+        let tx = self
+            .frame_tx
+            .as_ref()
+            .ok_or_else(|| "送帧通道已关闭".to_string())?;
+        match tx.try_send(frame.to_vec()) {
+            Ok(()) => Ok(true),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Ok(false),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err("写线程已退出，无法送帧".to_string())
+            }
         }
-        Ok(())
     }
 
+    /// 读取并切分输出访问单元（阻塞直到有数据）。
     fn self_expected_len(&self) -> usize {
         self.expected_len
     }
 
-    /// 读取并切分输出访问单元（阻塞直到有数据）。
     /// 非阻塞收取当前已可用的访问单元（不等待编码器）。
     pub fn read_units(&mut self) -> Result<Vec<AccessUnit>, String> {
         let mut got = false;
@@ -375,7 +412,11 @@ impl FfmpegEncoder {
 
     /// 结束编码并收集剩余输出。
     pub fn finish(&mut self) -> Result<Vec<AccessUnit>, String> {
-        self.stdin.take();
+        // 关闭送帧通道并等待写线程把残余帧写入 ffmpeg，再 flush
+        self.frame_tx.take();
+        if let Some(w) = self.writer.take() {
+            let _ = w.join();
+        }
         let mut units = Vec::new();
         // 等待读线程把剩余输出推完（通道断开即结束）
         if let Some(rx) = self.rx.as_ref() {

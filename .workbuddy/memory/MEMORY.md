@@ -58,7 +58,14 @@ Stage 0 ✅ / Stage 1 ✅ / Stage 2 ✅（物理主屏 60.1fps、首帧 14ms）/
 （本机 MttVDD 是 SignPath 跨签名，而能工作的第三方 IddCx 驱动是 Microsoft attestation 签名）。
 出路见 `docs/02-vdd-options.md`；**推荐路线 B：启动 ToDesk/Parsec 客户端连一次**
 （本机 Parsec/ToDesk/AskLink 适配器无客户端会话时不暴露模式）。
-未做：BGRA 直喂 ffmpeg / GPU 侧色彩转换、编码背压丢帧、MF 自研编码器、WebRTC、端到端延迟、macOS/Linux、键鼠回传。
+**✅ 性能优化已完成（11-15，延迟 175ms → 7.57ms）**：
+- 认知修正：175ms/872ms 是**积压深度**不是计算耗时；单帧真实编码 ~7ms。
+- 措施：BGRA 按行 memcpy（取代逐像素）、亮度只遍历采样点、写线程解耦 stdin、
+  有界通道(2)+try_send 背压丢帧、目标帧率 24。
+- **度量坑**：AU 与送帧序列无法一一对应（ffmpeg 内部丢帧/重排），
+  必须用"最近送帧时刻"作基准，不能用 push_ts.pop_front()（会虚高到 3 秒+）。
+未做：GPU 侧色彩转换（D3D11 VideoProcessor）、MF 自研编码器（进程内，预期可再降一个量级）、
+WebRTC、玻璃到玻璃延迟、macOS/Linux、键鼠回传。
 坑位：AU 边界≠VCL 边界（x264 多 slice，须解 first_mb_in_slice）；硬件编码器读写必须解耦否则死锁；
 ffmpeg SPS/PPS 只在码流开头出现一次（须缓存补齐关键帧）；`isConfigSupported` 返回 Promise。
 

@@ -30,17 +30,19 @@ pub struct FrameContent {
     pub is_black: bool,
 }
 
-/// 把 GPU 表面回读为 CPU 像素，并统计亮度；同时可选产出 NV12。
+/// 把 GPU 表面回读为 CPU 像素，并统计亮度；可选产出 NV12 或 BGRA。
 ///
 /// `sample_step`：每隔多少像素采一次点（用于亮度统计，越大越快越粗糙）。
-/// `nv12`：为 `Some` 时输出整帧 NV12（I420 半色度），供编码器使用。
+/// `nv12`：输出整帧 NV12（I420 半色度）。
+/// `bgra`：输出整帧 BGRA（WGC 原始格式，交给 ffmpeg 用 SIMD 转 NV12）。
 pub unsafe fn analyze_surface(
     device: &ID3D11Device,
     context: &ID3D11DeviceContext,
     surface: &IDirect3DSurface,
     sample_step: u32,
     nv12: bool,
-) -> Result<(FrameContent, Option<Vec<u8>>), String> {
+    bgra: bool,
+) -> Result<(FrameContent, Option<Vec<u8>>, Option<Vec<u8>>), String> {
     // WinRT 表面 -> D3D11 纹理
     let access: IDirect3DDxgiInterfaceAccess = surface
         .cast()
@@ -95,10 +97,26 @@ pub unsafe fn analyze_surface(
         height,
         sample_step,
         nv12,
+        bgra,
     );
 
     context.Unmap(&dst_resource, 0);
     result
+}
+
+/// 便捷函数：只回读并统计亮度，同时产出整帧 BGRA（供编码器输入）。
+///
+/// 相比 `analyze_surface(nv12=true)`：**不做逐像素色彩转换**，
+/// 由 ffmpeg 的 SIMD 路径负责 BGRA→NV12，这是当前最大的性能瓶颈所在。
+pub unsafe fn read_surface_bgra(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    surface: &IDirect3DSurface,
+    sample_step: u32,
+) -> Result<(FrameContent, Vec<u8>), String> {
+    let (content, _nv12, bgra) = analyze_surface(device, context, surface, sample_step, false, true)?;
+    let buf = bgra.ok_or_else(|| "BGRA 输出为空".to_string())?;
+    Ok((content, buf))
 }
 
 /// 对回读后的 BGRA 像素做亮度统计（可选同时转 NV12）。
@@ -112,7 +130,8 @@ unsafe fn analyze_pixels(
     height: usize,
     sample_step: u32,
     want_nv12: bool,
-) -> Result<(FrameContent, Option<Vec<u8>>), String> {
+    want_bgra: bool,
+) -> Result<(FrameContent, Option<Vec<u8>>, Option<Vec<u8>>), String> {
     let step = sample_step.max(1) as usize;
     let mut sum: u64 = 0;
     let mut max_luma: u8 = 0;
@@ -127,16 +146,25 @@ unsafe fn analyze_pixels(
     } else {
         None
     };
+    // BGRA：每像素 4 字节
+    let mut bgra: Option<Vec<u8>> = if want_bgra {
+        Some(vec![0u8; width * height * 4])
+    } else {
+        None
+    };
 
-    for y in 0..height {
-        let row = data.add(y * row_pitch);
-        for x in 0..width {
-            let px = row.add(x * 4);
-            let b = *px as f64;
-            let g = *px.add(1) as f64;
-            let r = *px.add(2) as f64;
-
-            if x % step == 0 && y % step == 0 {
+    // ---- 亮度统计：只遍历采样点（step 通常为 16，即 1/256 的像素）----
+    // 原来每像素都做一次取模判断（1080p = 200 万次），改为直接按步长跳跃。
+    {
+        let mut sy = 0usize;
+        while sy < height {
+            let row = data.add(sy * row_pitch);
+            let mut sx = 0usize;
+            while sx < width {
+                let px = row.add(sx * 4);
+                let b = *px as f64;
+                let g = *px.add(1) as f64;
+                let r = *px.add(2) as f64;
                 let luma = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
                 sum += luma as u64;
                 sampled += 1;
@@ -146,14 +174,35 @@ unsafe fn analyze_pixels(
                 if luma > 8 {
                     non_black += 1;
                 }
+                sx += step;
             }
+            sy += step;
+        }
+    }
 
-            if let Some(buf) = nv12.as_mut() {
-                // Y：BT.601 limited range
+    // ---- BGRA：按行整块拷贝（memcpy）----
+    // 源数据按 RowPitch 对齐（可能大于 width*4），目标是紧凑排列。
+    // 逐像素拷贝 200 万次曾是性能瓶颈；按行 memcpy 后由编译器用 rep movsb/SIMD。
+    if let Some(buf) = bgra.as_mut() {
+        for y in 0..height {
+            let src = data.add(y * row_pitch);
+            let dst = buf.as_mut_ptr().add(y * width * 4);
+            std::ptr::copy_nonoverlapping(src, dst, width * 4);
+        }
+    }
+
+    // ---- NV12：逐像素浮点转换 + 2x2 色度下采样（慢，仅调试/导出用）----
+    if let Some(buf) = nv12.as_mut() {
+        for y in 0..height {
+            let row = data.add(y * row_pitch);
+            for x in 0..width {
+                let px = row.add(x * 4);
+                let b = *px as f64;
+                let g = *px.add(1) as f64;
+                let r = *px.add(2) as f64;
                 let yy = (16.0 + (65.481 * r + 128.553 * g + 24.966 * b) / 255.0)
                     .clamp(0.0, 255.0) as u8;
                 buf[y * width + x] = yy;
-                // U/V：2x2 下采样（取左上角像素作为色度样本）
                 if x % 2 == 0 && y % 2 == 0 {
                     let u = (128.0 + (-37.797 * r - 74.203 * g + 112.0 * b) / 255.0)
                         .clamp(0.0, 255.0) as u8;
@@ -177,5 +226,5 @@ unsafe fn analyze_pixels(
         // 判定为黑画面：平均亮度极低且几乎没有非黑像素
         is_black: luma_avg < 1.0 && non_black_ratio < 0.001,
     };
-    Ok((content, nv12))
+    Ok((content, nv12, bgra))
 }

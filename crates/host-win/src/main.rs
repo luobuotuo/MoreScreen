@@ -208,9 +208,11 @@ fn main() {
             let cfg = remote_screen_host_win::encode::EncodeConfig {
                 width: target.mode.width.max(16),
                 height: target.mode.height.max(16),
-                fps: 30,
+                fps: 24,
                 bitrate_kbps: 6000,
                 gop: 30,
+                // 文件模式读 NV12 文件（capture-dump 产物）；实时模式输出 BGRA
+                pix_fmt: if arg_value(&args, "--nv12").is_some() { "nv12".into() } else { "bgra".into() },
             };
             let encoder = remote_screen_host_win::encode::detect_encoder(&ffmpeg);
             println!("编码器      : {}", encoder);
@@ -235,7 +237,7 @@ fn main() {
                 let frame_time = std::time::Duration::from_millis(1000 / cfg.fps as u64);
                 let mut next = std::time::Instant::now();
                 loop {
-                    if let Err(e) = enc.push_nv12(&data) {
+                    if let Err(e) = enc.push_frame(&data) {
                         eprintln!("推帧失败: {e}");
                         break;
                     }
@@ -281,6 +283,7 @@ fn main() {
                 let mut frame_id: u64 = 0;
                 let mut last_sent: u64 = 0;
                 let mut push_ts: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+                let mut dropped_frames: u64 = 0;
                 let res = remote_screen_host_win::capture::capture_stream(
                     target.bounds.x,
                     target.bounds.y,
@@ -288,15 +291,22 @@ fn main() {
                     target.mode.height,
                     seconds * 1000,
                     cfg.fps,
-                    |nv12| {
+                    |bgra| {
                         let t_capture = t_origin.elapsed().as_nanos() as u64;
-                        enc2.push_nv12(nv12)?;
+                        let queued = enc2.push_frame(bgra)?;
+                        if !queued {
+                            dropped_frames += 1;
+                        }
                         // 送帧时间戳入队：出流时按序弹出，保证指标对应到同一帧
                         push_ts.push_back(t_capture);
                         let chunks = enc2.read_chunks()?;
                         for c in chunks {
                             let t_enc_out = t_origin.elapsed().as_nanos() as u64;
-                            let t_frame = push_ts.pop_front().unwrap_or(t_capture);
+                            // ffmpeg 内部可能丢帧/重排，AU 无法与送帧序列一一对应。
+                            // 用最近一次送帧时刻作基准：编码器跟得上时该值≈单帧编码耗时，
+                            // 落后时该值即"输出滞后于输入"的积压深度。
+                            let t_frame = *push_ts.back().unwrap_or(&t_capture);
+                            push_ts.clear();
                             let mut framed = Vec::with_capacity(c.data.len() + 1);
                             framed.push(if c.key { 1u8 } else { 0u8 });
                             framed.extend_from_slice(&c.data);
@@ -333,6 +343,9 @@ fn main() {
                 if let Some(mut rec) = recorder.take() {
                     let _ = rec.flush();
                     println!("分段指标已写入: {}", metric_path);
+                }
+                if dropped_frames > 0 {
+                    println!("背压丢帧: {} 帧（编码器消费不过来，主动丢弃以控制延迟）", dropped_frames);
                 }
                 match res {
                     Ok(stats) => {
