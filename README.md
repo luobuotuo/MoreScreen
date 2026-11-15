@@ -55,6 +55,12 @@ cargo run --release -p remote-screen-core --bin core_selfcheck
 
 # 虚拟屏就绪检测 + 扩展屏采集闭环验证（等待虚拟屏出现后自动采集并导出 PNG）
 python scripts/verify_virtual_screen.py --timeout 180
+
+# 启动流服务（手机/平板浏览器接收端用）。rs-host.exe 未加入 PATH，请用启动脚本：
+scripts\run_stream.cmd                        # Windows：默认物理主屏，WS 端口 8787
+scripts\run_stream.cmd --index 5              # 指定显示目标编号
+# 启动后用手机/平板浏览器打开它打印的「接收端页面」地址（形如 http://192.168.0.104:8788/）
+# 注意：服务前台运行，关闭窗口即停止
 ```
 
 ### 点亮虚拟屏的两种方式
