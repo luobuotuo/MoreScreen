@@ -49,6 +49,10 @@ Stage 0 ✅ / Stage 1 ✅ / Stage 2 ✅（物理主屏 60.1fps、首帧 14ms）/
 **关键认知：`pnputil /add-driver /install` 永远不会创建 root-enumerated(SWD) 设备节点**，
 必须走 SetupAPI 四步（SetupDiCreateDeviceInfoList → SetupDiCreateDeviceInfo+写 SPDRP_HARDWAREID
 → DIF_REGISTERDEVICE → UpdateDriverForPlugAndPlayDevices），等价 devcon install 但无需装 WDK。
+**✅ 扩展屏采集闭环已完成（11-15 10:44 实测）**：手机 ToDesk 开「隐私屏」→切「虚拟屏1」后，
+系统新增 `Root\ToDeskIddDriver`，IddCx 创建 800×600@60 虚拟屏（位置 1920,0）；
+`rs-host` 采集 358 帧/60.0fps、首帧 39.6ms、非黑占比 100%、NV12 720,000B，导出帧肉眼可读。
+一键验证工具：`python scripts/verify_virtual_screen.py`。
 **新阻塞：MttVDD.dll 未被任何进程加载**（tasklist /m 无结果），setupapi 报
 `CM_PROB_FAILED_START / 0x8007001f ERROR_NOT_SUPPORTED` → 驱动签名策略拒绝
 （本机 MttVDD 是 SignPath 跨签名，而能工作的第三方 IddCx 驱动是 Microsoft attestation 签名）。
