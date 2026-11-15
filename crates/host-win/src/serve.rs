@@ -18,6 +18,11 @@ pub struct Hub {
     clients: Arc<Mutex<Vec<Client>>>,
     /// 最近一个关键帧访问单元：新客户端接入时立即补发，避免它等到下一个 GOP。
     last_keyframe: Arc<Mutex<Option<Vec<u8>>>>,
+    /// 客户端发来的文本消息（信令回传：answer / ICE candidate）。
+    inbox: Arc<Mutex<Vec<String>>>,
+    /// 最近一条信令（offer）：新客户端接入时立即补发，
+    /// 否则客户端连晚了就永久收不到 offer（与 last_keyframe 同一机制）。
+    last_signal: Arc<Mutex<Option<String>>>,
 }
 
 impl Hub {
@@ -25,18 +30,49 @@ impl Hub {
         Self {
             clients: Arc::new(Mutex::new(Vec::new())),
             last_keyframe: Arc::new(Mutex::new(None)),
+            inbox: Arc::new(Mutex::new(Vec::new())),
+            last_signal: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 登记新客户端，并立即补发最近的关键帧。
+    /// 登记新客户端，并立即补发最近的关键帧与最近的信令。
+    ///
+    /// 补发信令很关键：offer 只在会话建立时产生一次，
+    /// 若客户端在那之后才连上，不补发就永远收不到 offer。
     fn add(&self, client: Client) {
-        let kf = self.last_keyframe.lock().unwrap().clone();
-        if let Some(data) = kf {
-            if let Ok(mut ws) = client.lock() {
-                let _ = ws.send(Message::Binary(data));
+        {
+            let kf = self.last_keyframe.lock().unwrap().clone();
+            if let Some(data) = kf {
+                if let Ok(mut ws) = client.lock() {
+                    let _ = ws.send(Message::Binary(data));
+                }
+            }
+        }
+        {
+            let sig = self.last_signal.lock().unwrap().clone();
+            if let Some(text) = sig {
+                if let Ok(mut ws) = client.lock() {
+                    let _ = ws.send(Message::Text(text));
+                }
             }
         }
         self.clients.lock().unwrap().push(client);
+    }
+
+    /// 记录一条客户端发来的文本消息（信令）。
+    fn push_inbox(&self, text: String) {
+        self.inbox.lock().unwrap().push(text);
+    }
+
+    /// 非阻塞取出所有待处理的信令消息（主线程轮询）。
+    pub fn poll_inbox(&self) -> Vec<String> {
+        std::mem::take(&mut *self.inbox.lock().unwrap())
+    }
+
+    /// 广播一段文本（JSON 信令）并缓存，返回 (成功数, 断开数)。
+    pub fn broadcast_text(&self, text: &str) -> (usize, usize) {
+        *self.last_signal.lock().unwrap() = Some(text.to_string());
+        self.broadcast_raw(Message::Text(text.to_string()))
     }
 
     /// 更新关键帧缓存。
@@ -50,6 +86,11 @@ impl Hub {
 
     /// 广播一个二进制访问单元，返回 (成功数, 断开的客户端数)。
     pub fn broadcast(&self, data: &[u8]) -> (usize, usize) {
+        self.broadcast_raw(Message::Binary(data.to_vec()))
+    }
+
+    /// 通用广播：发送指定消息，清理断开的客户端。
+    fn broadcast_raw(&self, msg: Message) -> (usize, usize) {
         let mut clients = self.clients.lock().unwrap();
         let mut alive = Vec::with_capacity(clients.len());
         let mut ok = 0usize;
@@ -57,7 +98,7 @@ impl Hub {
         for c in clients.drain(..) {
             let sent = {
                 let mut ws = c.lock().unwrap();
-                match ws.send(Message::Binary(data.to_vec())) {
+                match ws.send(msg.clone()) {
                     Ok(()) => true,
                     Err(e) => {
                         eprintln!("[ws] 发送失败，移除客户端: {e}");
@@ -93,7 +134,28 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
             std::thread::spawn(move || {
                 if let Ok(ws) = accept(stream) {
                     let client: Client = Arc::new(Mutex::new(ws));
-                    hub.add(client);
+                    hub.add(client.clone());
+                    // 持续读取客户端消息（信令回传：answer / ICE candidate）
+                    loop {
+                        let msg = {
+                            let mut guard = match client.lock() {
+                                Ok(g) => g,
+                                Err(_) => break,
+                            };
+                            match guard.read() {
+                                Ok(m) => m,
+                                Err(_) => break, // 连接断开
+                            }
+                        };
+                        match msg {
+                            Message::Text(t) => hub.push_inbox(t),
+                            Message::Binary(b) => {
+                                hub.push_inbox(String::from_utf8_lossy(&b).to_string())
+                            }
+                            Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
                 }
             });
         }

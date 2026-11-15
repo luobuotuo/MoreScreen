@@ -426,6 +426,156 @@ fn main() {
             }
             std::process::exit(exit_code);
         }
+        "stream-webrtc" => {
+            // WebRTC 路线（P1.2）：WGC 采集 -> QSV 编码 -> webrtc-rs -> 浏览器 <video>
+            let ws_port = arg_value(&args, "--port")
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(8787);
+            let http_port = ws_port + 1;
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let seconds = arg_value(&args, "--seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60);
+            let fps: u32 = arg_value(&args, "--fps")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(24);
+
+            let ffmpeg = match resolve_ffmpeg() {
+                Some(p) => p,
+                None => {
+                    eprintln!("未找到 ffmpeg：请设置 RS_FFMPEG 或放到 tools/ffmpeg/bin/");
+                    std::process::exit(4);
+                }
+            };
+            let (hub, ws_bound) = match remote_screen_host_win::serve::start_ws(ws_port) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("WebSocket 服务启动失败: {e}");
+                    std::process::exit(5);
+                }
+            };
+            let http_bound = remote_screen_host_win::serve::start_http(http_port, "web/receiver")
+                .map(|p| p)
+                .unwrap_or(http_port);
+            let ip = remote_screen_host_win::serve::local_ipv4()
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            println!("ffmpeg      : {}", ffmpeg);
+            println!("WS 信令     : ws://{ip}:{ws_bound}");
+            println!("接收端页面  : http://{ip}:{http_bound}/webrtc.html");
+            println!("等待接收端连接…（页面需点「开始接收」）");
+
+            let displays = enumerate_displays();
+            let target = match displays.get(index) {
+                Some(d) => d,
+                None => {
+                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    std::process::exit(2);
+                }
+            };
+            println!("采集目标    : {}", target.label());
+
+            let cfg = remote_screen_host_win::encode::EncodeConfig {
+                width: target.mode.width.max(16),
+                height: target.mode.height.max(16),
+                fps,
+                bitrate_kbps: 6000,
+                gop: fps,
+                pix_fmt: "bgra".into(),
+            };
+            let encoder = remote_screen_host_win::encode::detect_encoder(&ffmpeg);
+            println!("编码器      : {}  目标帧率: {} fps", encoder, fps);
+            let enc = match remote_screen_host_win::encode::FfmpegEncoder::start(
+                &cfg, &ffmpeg, &encoder,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("编码器启动失败: {e}");
+                    std::process::exit(6);
+                }
+            };
+
+            // WebRTC 会话（spawn tokio 线程）
+            let rtc = match remote_screen_host_win::webrtc::WebRtcHandle::spawn(fps) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("WebRTC 会话启动失败: {e}");
+                    std::process::exit(7);
+                }
+            };
+
+            let hub2 = hub.clone();
+            let mut enc2 = enc;
+            let mut au_count: u64 = 0;
+            let mut dropped: u64 = 0;
+
+            let res = remote_screen_host_win::capture::capture_stream(
+                target.bounds.x,
+                target.bounds.y,
+                target.mode.width,
+                target.mode.height,
+                seconds * 1000,
+                fps,
+                |bgra| {
+                    let queued = enc2.push_frame(bgra)?;
+                    if !queued {
+                        dropped += 1;
+                    }
+                    let chunks = enc2.read_chunks()?;
+                    for c in chunks {
+                        // WebRTC 模式送原始 AU（不带标记位），packetization 交给 H264Payloader
+                        rtc.push_frame(&c.data);
+                        au_count += 1;
+                    }
+                    // 信令上报：offer / candidate
+                    while let Some(sig) = rtc.poll_signal() {
+                        use remote_screen_host_win::webrtc::SignalOut;
+                        match sig {
+                            SignalOut::Offer { sdp } => {
+                                let (ok, _dead) = hub2.broadcast_text(&format!(
+                                    "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
+                                    json_escape(&sdp)
+                                ));
+                                if ok > 0 {
+                                    println!("[webrtc] offer 已发送给 {ok} 个客户端");
+                                }
+                            }
+                            SignalOut::Candidate { candidate, sdp_mid, sdp_mline_index } => {
+                                hub2.broadcast_text(&format!(
+                                    "{{\"t\":\"webrtc-cand\",\"candidate\":\"{}\",\"sdpMid\":\"{}\",\"sdpMLineIndex\":{}}}",
+                                    json_escape(&candidate),
+                                    sdp_mid.clone().unwrap_or_default(),
+                                    sdp_mline_index.unwrap_or(0)
+                                ));
+                            }
+                            SignalOut::State(s) => println!("[webrtc] {s}"),
+                        }
+                    }
+                    // 信令回传：answer / candidate
+                    for text in hub2.poll_inbox() {
+                        if let Some(sig) = parse_signal_json(&text) {
+                            rtc.deliver(sig);
+                        }
+                    }
+                    Ok(())
+                },
+            );
+
+            rtc.close();
+            match res {
+                Ok(stats) => {
+                    println!(
+                        "采集结束: {} 帧 / {:.1} fps / 首帧 {:.1} ms",
+                        stats.frames,
+                        if stats.avg_interval_ms > 0.0 { 1000.0 / stats.avg_interval_ms } else { 0.0 },
+                        stats.first_frame_delay_ms
+                    );
+                }
+                Err(e) => eprintln!("采集失败: {e}"),
+            }
+            println!("访问单元数: {au_count}   背压丢帧: {dropped}");
+        }
         "capture-probe" => {
             // 采集探测：抓取指定显示器若干秒，输出帧率与内容尺寸
             let displays = enumerate_displays();
@@ -560,4 +710,64 @@ fn which(name: &str) -> bool {
         }
     }
     false
+}
+
+/// 从 JSON 文本中提取一个字符串字段的值（已做反转义）。
+fn json_get_string(text: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let start = text.find(&pat)? + pat.len();
+    let rest = &text[start..];
+    let mut out = String::new();
+    let mut chars = rest.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('/') => out.push('/'),
+                Some('u') => {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) { out.push(ch); }
+                    }
+                }
+                _ => {}
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// 从 JSON 文本中提取一个整数字段。
+fn json_get_int(text: &str, key: &str) -> Option<i64> {
+    let pat = format!("\"{key}\":");
+    let start = text.find(&pat)? + pat.len();
+    let rest = text[start..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse::<i64>().ok()
+}
+
+/// 解析浏览器回传的信令 JSON，转成 `SignalIn`。
+fn parse_signal_json(text: &str) -> Option<remote_screen_host_win::webrtc::SignalIn> {
+    use remote_screen_host_win::webrtc::SignalIn;
+    let t = json_get_string(text, "t")?;
+    match t.as_str() {
+        "webrtc-answer" => {
+            let sdp = json_get_string(text, "sdp")?;
+            Some(SignalIn::Answer { sdp })
+        }
+        "webrtc-cand" => Some(SignalIn::Candidate {
+            candidate: json_get_string(text, "candidate").unwrap_or_default(),
+            sdp_mid: json_get_string(text, "sdpMid"),
+            sdp_mline_index: json_get_int(text, "sdpMLineIndex").map(|v| v as u16),
+        }),
+        _ => None,
+    }
 }

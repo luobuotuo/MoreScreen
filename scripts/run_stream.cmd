@@ -3,9 +3,13 @@ REM ---------------------------------------------------------------------------
 REM  MoreScreen stream service launcher
 REM
 REM  Usage:
-REM      scripts\run_stream.cmd                           (default: primary monitor, WS 8787)
-REM      scripts\run_stream.cmd --index 5                 (pick a display target)
-REM      scripts\run_stream.cmd --index 0 --seconds 300   (any extra args pass through)
+REM      scripts\run_stream.cmd                              (default: primary monitor, WS 8787)
+REM      scripts\run_stream.cmd --webrtc                     (WebRTC route A, recommended)
+REM      scripts\run_stream.cmd --index 5                    (pick a display target)
+REM      scripts\run_stream.cmd --index 0 --seconds 300      (any extra args pass through)
+REM
+REM  Route A (WebRTC) is the recommended transport: browser <video> + WebRTC.
+REM  Open http://<host-ip>:8788/webrtc.html on the receiver device and tap Start.
 REM
 REM  Notes:
 REM     - rs-host.exe is NOT on PATH; this script calls it by absolute path.
@@ -38,7 +42,9 @@ echo   args   : %*
 echo ============================================================
 echo.
 
-"%EXE%" stream %*
+set "MODE=stream"
+for %%A in (%*) do if /I "%%A"=="--webrtc" set "MODE=stream-webrtc"
+"%EXE%" %MODE% %*
 
 echo.
 echo [service stopped]

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>remote-screen 接收端（WebRTC）</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101114; color: #e8eaed; font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+  header { padding: 10px 14px; border-bottom: 1px solid #26282e; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .stat { color: #9aa0a6; font-variant-numeric: tabular-nums; }
+  .stat b { color: #8ab4f8; font-weight: 600; }
+  .ok { color: #81c995; } .bad { color: #f28b82; } .warn { color: #fdd663; }
+  #stage { padding: 16px; }
+  video { width: 100%; height: auto; background: #000; border-radius: 8px; display: block; }
+  #start { display: block; width: 100%; max-width: 420px; margin: 40px auto; padding: 16px; font-size: 16px;
+           background: #1a73e8; color: #fff; border: 0; border-radius: 10px; }
+  .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
+  #log { margin-top: 12px; color: #9aa0a6; font-size: 12px; white-space: pre-wrap; max-height: 30vh; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>remote-screen 接收端 · WebRTC</h1>
+  <span class="stat">信令 <b id="ws">未连接</b></span>
+  <span class="stat">ICE <b id="ice">—</b></span>
+  <span class="stat">连接 <b id="pc">—</b></span>
+  <span class="stat">分辨率 <b id="res">—</b></span>
+  <span class="stat">帧率 <b id="fps">—</b></span>
+  <span class="stat">码率 <b id="rate">—</b></span>
+</header>
+
+<div id="stage">
+  <video id="v" playsinline webkit-playsinline muted autoplay></video>
+  <button id="start">点击开始接收</button>
+  <div class="bar"><i id="bar"></i></div>
+  <div id="log"></div>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const logEl = el('log');
+const lines = [];
+function L(s, cls) {
+  lines.push(s);
+  logEl.textContent = lines.join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+  if (cls) { el('pc').className = 'stat ' + cls; }
+}
+
+const WS_PORT = 8787;
+const video = el('v');
+let pc = null, ws = null, started = false;
+
+function send(obj) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+function buildPeerConnection() {
+  pc = new RTCPeerConnection({ iceServers: [] });   // 与宿主一致：只收 host candidate
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      send({ t: 'webrtc-cand', candidate: e.candidate.candidate,
+             sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex });
+    } else {
+      L('ICE candidate 收集完成');
+    }
+  };
+  pc.oniceconnectionstatechange = () => { el('ice').textContent = pc.iceConnectionState; };
+  pc.onconnectionstatechange = () => {
+    el('pc').textContent = pc.connectionState;
+    if (pc.connectionState === 'connected') L('✅ WebRTC 已连接', 'ok');
+    if (pc.connectionState === 'failed') L('❌ 连接失败', 'bad');
+    if (pc.connectionState === 'disconnected') L('⚠️ 连接断开', 'warn');
+  };
+  pc.ontrack = (e) => {
+    L('收到远端视频轨');
+    video.srcObject = e.streams[0];
+    video.play().then(() => L('视频开始播放')).catch(err => L('play() 被拒: ' + err.message));
+  };
+
+  // 每秒统计一次
+  setInterval(async () => {
+    if (!pc || pc.connectionState !== 'connected') return;
+    try {
+      const st = await pc.getStats();
+      let frames = 0, bytes = 0, w = 0, h = 0;
+      st.forEach(r => {
+        if (r.type === 'inbound-rtp' && r.kind === 'video') {
+          frames = r.framesDecoded || 0; bytes = r.bytesReceived || 0;
+        }
+        if (r.type === 'track' && r.kind === 'video') {
+          w = r.frameWidth; h = r.frameHeight;
+        }
+      });
+      if (w && h) el('res').textContent = w + 'x' + h;
+      el('fps').textContent = frames > 0 ? frames + ' 帧累计' : '—';
+      el('rate').textContent = bytes > 0 ? (bytes / 1024).toFixed(0) + ' KB 累计' : '—';
+      el('bar').style.width = Math.min(100, frames % 120) + '%';
+    } catch (e) {}
+  }, 1000);
+}
+
+function connectSignaling() {
+  ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT + '/');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { el('ws').textContent = '已连接'; L('信令已连接，等待宿主 offer…'); };
+  ws.onclose = () => { el('ws').textContent = '已断开'; L('信令断开'); };
+  ws.onerror = () => { el('ws').textContent = '错误'; L('信令错误'); };
+  ws.onmessage = async (ev) => {
+    let msg;
+    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data)); }
+    catch (e) { return; }   // 二进制视频数据忽略
+
+    if (msg.t === 'webrtc-offer') {
+      if (!pc) buildPeerConnection();
+      L('收到 offer，生成 answer…');
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        send({ t: 'webrtc-answer', sdp: answer.sdp });
+        L('answer 已回传');
+      } catch (err) {
+        L('❌ SDP 协商失败: ' + err, 'bad');
+      }
+    } else if (msg.t === 'webrtc-cand') {
+      if (!pc) return;
+      try {
+        await pc.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.sdpMid, sdpMLineIndex: msg.sdpMLineIndex });
+      } catch (e) { L('addIceCandidate: ' + e.message); }
+    }
+  };
+}
+
+el('start').addEventListener('click', () => {
+  if (started) return;
+  started = true;
+  el('start').style.display = 'none';
+  L('用户已确认开始接收');
+  connectSignaling();
+});
+</script>
+</body>
+</html>

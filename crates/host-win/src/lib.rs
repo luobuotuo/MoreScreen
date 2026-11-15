@@ -9,3 +9,4 @@ pub mod vdd;
 
 /// P1.1 验证工具：H.264 Annex B 解析与 webrtc-rs payloader 兼容性检查。
 pub mod h264probe;
+pub mod webrtc;
