@@ -30,6 +30,9 @@
   <span class="stat">分辨率 <b id="res">—</b></span>
   <span class="stat">帧率 <b id="fps">—</b></span>
   <span class="stat">码率 <b id="rate">—</b></span>
+  <span class="stat">丢包 <b id="loss">—</b></span>
+  <span class="stat">RTT <b id="rtt">—</b></span>
+  <span class="stat">缓冲 <b id="jb">—</b></span>
 </header>
 
 <div id="stage">
@@ -43,16 +46,19 @@
 const el = id => document.getElementById(id);
 const logEl = el('log');
 const lines = [];
-function L(s, cls) {
-  lines.push(s);
+function L(s) {
+  const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  lines.push('[' + ts + '] ' + s);
+  if (lines.length > 200) lines.splice(0, lines.length - 200);
   logEl.textContent = lines.join('\n');
   logEl.scrollTop = logEl.scrollHeight;
-  if (cls) { el('pc').className = 'stat ' + cls; }
 }
 
 const WS_PORT = 8787;
 const video = el('v');
 let pc = null, ws = null, started = false;
+let tStart = 0, firstFrameLogged = false;
+
 
 function send(obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -80,27 +86,69 @@ function buildPeerConnection() {
     L('收到远端视频轨');
     video.srcObject = e.streams[0];
     video.play().then(() => L('视频开始播放')).catch(err => L('play() 被拒: ' + err.message));
+
+    // 首帧真正上屏的时刻（玻璃侧口径）：含信令 + ICE + SDP + 首个关键帧
+    if (!firstFrameLogged && tStart && video.requestVideoFrameCallback) {
+      firstFrameLogged = true;
+      video.requestVideoFrameCallback(() => {
+        L('★ 首帧上屏 +' + (performance.now() - tStart).toFixed(0) + ' ms');
+      });
+    }
   };
 
-  // 每秒统计一次
+  // 每秒采样一次：对外只给瞬时值（差分），累计值对判断卡顿没有意义
+  let prev = null;
   setInterval(async () => {
     if (!pc || pc.connectionState !== 'connected') return;
-    try {
-      const st = await pc.getStats();
-      let frames = 0, bytes = 0, w = 0, h = 0;
-      st.forEach(r => {
-        if (r.type === 'inbound-rtp' && r.kind === 'video') {
-          frames = r.framesDecoded || 0; bytes = r.bytesReceived || 0;
-        }
-        if (r.type === 'track' && r.kind === 'video') {
-          w = r.frameWidth; h = r.frameHeight;
-        }
-      });
-      if (w && h) el('res').textContent = w + 'x' + h;
-      el('fps').textContent = frames > 0 ? frames + ' 帧累计' : '—';
-      el('rate').textContent = bytes > 0 ? (bytes / 1024).toFixed(0) + ' KB 累计' : '—';
-      el('bar').style.width = Math.min(100, frames % 120) + '%';
-    } catch (e) {}
+    let st;
+    try { st = await pc.getStats(); } catch (e) { return; }
+
+    let frames = 0, bytes = 0, lost = 0, recv = 0, jbDelay = 0, jbCount = 0;
+    let rttMs = null, tw = 0, th = 0;
+    st.forEach(r => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        frames  = r.framesDecoded || 0;
+        bytes   = r.bytesReceived || 0;
+        lost    = r.packetsLost || 0;
+        recv    = r.packetsReceived || 0;
+        jbDelay = r.jitterBufferDelay || 0;
+        jbCount = r.jitterBufferEmittedCount || 0;
+      }
+      if (r.type === 'track' && r.kind === 'video') { tw = r.frameWidth || 0; th = r.frameHeight || 0; }
+      if (r.type === 'candidate-pair' && r.state === 'succeeded'
+          && typeof r.currentRoundTripTime === 'number') {
+        rttMs = r.currentRoundTripTime * 1000;
+      }
+    });
+
+    // 分辨率：video 元素解码后的真实像素最可信（track stats 在部分内核上不填）
+    const w = video.videoWidth || tw, h = video.videoHeight || th;
+    if (w && h) el('res').textContent = w + 'x' + h;
+
+    // 丢包率：累计占比比 1s 差值稳
+    const totalPkts = lost + recv;
+    if (totalPkts > 0) {
+      const pct = lost * 100 / totalPkts;
+      const l = el('loss');
+      l.textContent = lost + ' / ' + pct.toFixed(2) + '%';
+      l.style.color = pct > 3 ? '#f28b82' : pct > 0.5 ? '#fdd663' : '#81c995';
+    }
+    if (rttMs !== null) el('rtt').textContent = rttMs.toFixed(1) + ' ms';
+    // jitterBufferDelay 是解码前缓冲时长，端到端延迟的主要可见组成
+    if (jbCount > 0) el('jb').textContent = (jbDelay * 1000 / jbCount).toFixed(0) + ' ms';
+
+    const now = performance.now();
+    if (prev && now > prev.t) {
+      const dt = (now - prev.t) / 1000;
+      const fpsNow = (frames - prev.frames) / dt;
+      const kbps = (bytes - prev.bytes) * 8 / 1000 / dt;
+      el('fps').textContent = fpsNow > 0 ? fpsNow.toFixed(1) + ' fps' : '0 fps';
+      el('rate').textContent = kbps >= 1000
+        ? (kbps / 1000).toFixed(2) + ' Mbps'
+        : Math.max(0, kbps).toFixed(0) + ' kbps';
+      el('bar').style.width = Math.max(0, Math.min(100, kbps / 80)) + '%';   // 8 Mbps 满格
+    }
+    prev = { t: now, frames, bytes };
   }, 1000);
 }
 
@@ -139,6 +187,7 @@ function connectSignaling() {
 el('start').addEventListener('click', () => {
   if (started) return;
   started = true;
+  tStart = performance.now();
   el('start').style.display = 'none';
   L('用户已确认开始接收');
   connectSignaling();

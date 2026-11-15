@@ -467,6 +467,10 @@ fn main() {
             println!("等待接收端连接…（页面需点「开始接收」）");
 
             let displays = enumerate_displays();
+            // 打印全部目标：虚拟屏接入后需要靠 --index 选，不列出来只能靠猜
+            for (i, d) in displays.iter().enumerate() {
+                println!("  [{i}] {}", d.label());
+            }
             let target = match displays.get(index) {
                 Some(d) => d,
                 None => {

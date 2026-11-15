@@ -64,8 +64,14 @@ Stage 0 ✅ / Stage 1 ✅ / Stage 2 ✅（物理主屏 60.1fps、首帧 14ms）/
   有界通道(2)+try_send 背压丢帧、目标帧率 24。
 - **度量坑**：AU 与送帧序列无法一一对应（ffmpeg 内部丢帧/重排），
   必须用"最近送帧时刻"作基准，不能用 push_ts.pop_front()（会虚高到 3 秒+）。
-未做：GPU 侧色彩转换（D3D11 VideoProcessor）、MF 自研编码器（进程内，预期可再降一个量级）、
-WebRTC、玻璃到玻璃延迟、macOS/Linux、键鼠回传。
+**✅ P1.2 WebRTC 真机出画面（11-15 13:5x）**：华为平板+华为浏览器打开
+`http://<IP>:8788/webrtc.html` 点「开始接收」→ 信令/ICE/连接/视频全绿，累计 232 帧/7824KB。
+接收端统计已重做：瞬时 fps/kbps（差分）、丢包率、RTT、jitterBuffer 延迟、`★首帧上屏 +N ms`；
+**分辨率必须取 `video.videoWidth/videoHeight`**（`track` stats 在该内核不填，原代码因此永远显示 —）。
+CLI 启动时打印显示器清单，便于 `--index` 选屏。
+**仍未做**：采集源仍为主屏镜像（未切虚拟屏）、**玻璃到玻璃延迟无度量**（需画面内嵌时间戳）、
+码率/帧率自适应（现固定 6000kbps/24fps，平板可见块状）、GPU 侧色彩转换（D3D11 VideoProcessor）、
+MF 自研编码器（进程内，预期再降一个量级）、macOS/Linux、键鼠回传。
 坑位：AU 边界≠VCL 边界（x264 多 slice，须解 first_mb_in_slice）；硬件编码器读写必须解耦否则死锁；
 ffmpeg SPS/PPS 只在码流开头出现一次（须缓存补齐关键帧）；`isConfigSupported` 返回 Promise。
 

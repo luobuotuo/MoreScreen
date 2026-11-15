@@ -157,39 +157,6 @@ CPU 侧 BGRA→NV12 转换（见下节实测），与虚拟屏本身无关。
 > 无法加载（见下节），产品化阶段需换成 Microsoft attestation 签名的驱动或自研。
 
 
-## 七之前、虚拟屏采集闭环：已完成（11-15 10:44 实测）
-
-### 点亮方式
-
-手机 ToDesk 连接本机 → 在手机端会话里开启「隐私屏」→ 切换到「虚拟屏1」。
-开启后系统新增 `Root\ToDeskIddDriver` 适配器（10 个设备节点），
-切到虚拟屏后 IddCx 监视器才真正创建。
-
-### 实测结果（`scripts/verify_virtual_screen.py` 自动完成）
-
-| 指标 | 实测值 |
-|---|---|
-| 虚拟屏 | `MONITOR\MTT1337\{4d36e96e-...} 5`（设备实例 ID，符合"不用下标"铁律） |
-| 设备路径 | `\.\DISPLAY76` |
-| 分辨率 / 刷新率 | 800×600 @ 60 Hz |
-| **位置** | **(1920, 0)** —— 主屏右侧，即真正的"扩展桌面"布局 |
-| 采集帧数 | 358 帧 / 6 秒 |
-| **平均帧间隔** | **16.66 ms ≈ 60.0 fps** |
-| 首帧延迟 | 39.6 ms |
-| 内容尺寸 | 800×600 |
-| 内容自检 | 平均亮度 195.9 / 峰值 250 / **非黑占比 100.0%** |
-| NV12 导出 | 720,000 字节（= 800×600×1.5，字节数精确一致） |
-| 肉眼验证 | 真实桌面壁纸 + 完整任务栏 + 时间 10:44（`out/vscreen_preview.png`） |
-
-### 结论
-
-「虚拟显示器 → 指定屏采集 → 内容自检 → NV12 输出」整条链路**已在真实虚拟屏上跑通**，
-且采集目标用**设备实例 ID**绑定（插拔/重排不错绑）。剩下的瓶颈仍是
-CPU 侧 BGRA→NV12 转换（见下节实测），与虚拟屏本身无关。
-
-> 说明：本次点亮用的是 ToDesk 自带的会话型 IddCx 驱动；自研 MttVDD 因签名策略
-> 无法加载（见下节），产品化阶段需换成 Microsoft attestation 签名的驱动或自研。
-
 ## 七、VDD 设备节点：已建立（方法与结论）
 
 ### 关键认知：`pnputil` 不会创建 root-enumerated 设备节点
@@ -264,70 +231,36 @@ setupapi.dev.log 给出明确原因：
 结论：**这不是"节点没建起来"，而是"驱动被驱动签名策略拒绝加载"**。
 四条可选出路见 `docs/02-vdd-options.md`。
 
-## 八、P1.2 WebRTC 最小闭环：本机全通，待真机验证（11-15）
+## 八、P1.2 WebRTC 闭环：真机出画面（11-15 13:5x 达成）
 
-### 已完成
+### 验证结果（华为平板 · 华为浏览器；采集源 = 主屏 1920x1080 镜像）
 
-| 组件 | 文件 | 说明 |
-|---|---|---|
-| 会话管理 | `crates/host-win/src/webrtc.rs` | 线程桥接（同步采集 → `sync_channel(2)` → tokio `current_thread` 运行时 → `write_sample`）；有界通道背压丢帧；RTP 时间戳 90kHz |
-| API 构建 | `webrtc::build_api()` | **只注册一种 H.264**（42e01f + packetization-mode=1）+ 禁用 mDNS |
-| 信令 | `serve.rs` Hub | 新增 `broadcast_text` / `poll_inbox` / **信令缓存与新客户端补发**；JSON 手工编解码（`json_escape` 复用 core） |
-| 接收端 | `web/receiver/webrtc.html` | `RTCPeerConnection` + `<video srcObject>`；`playsinline`/`muted`；连接状态与 `getStats()` 展示；需用户点「开始接收」 |
-| CLI | `rs-host stream-webrtc` | 全链路串联；`--fps` 可调 |
-| 启动器 | `scripts/run_stream.cmd --webrtc` | 一键启动 |
+| 环节 | 实测 |
+|---|---|
+| 信令 | 已连接 → 收到 offer → answer 回传 |
+| ICE | connected（host candidate，无 STUN/TURN） |
+| DTLS/SRTP | connected |
+| 视频 | 收到远端视频轨 → 视频开始播放 |
+| 累计 | 232 帧 / 7824 KB |
 
-### 三个关键实测结论（都是踩出来的）
+**结论：路线 A（webrtc-rs + 浏览器 `<video srcObject>`）主链路在真实设备上打通，接收端不需要任何原生 App。**
 
-1. **必须 `create_data_channel` + 等 `gathering_complete_promise`**：否则后台 ICE gathering 不被触发，
-   `local_description` 不含候选，ICE 永远停在 Connecting。标准做法是把**含候选的 SDP** 直接传给对端，
-   不依赖 trickle 转发。（依据 webrtc-rs 官方 `signal_pair` 流程）
-2. **必须禁用 mDNS**：默认模式产生 `.local` 候选，局域网对端无法解析。
-   `SettingEngine::set_ice_multicast_dns_mode(MulticastDnsMode::Disabled)`。
-3. **必须只注册一种 H.264 codec**：`register_default_codecs()` 会注册 6 种 H264 变体，
-   浏览器可能协商到 `42001f`（非 constrained）而编码器输出是 `42e01f`，profile 不匹配会花屏/拒收。
+### 截图暴露的接收端统计缺陷（本轮已修）
 
-### 本机验证结果
+1. **分辨率显示 `—`**：原代码只从 `track` stats 取 `frameWidth/frameHeight`，该内核不填这两个字段。
+   → 改为优先 `video.videoWidth/videoHeight`（解码后真实像素），`track` stats 仅兜底。
+2. **帧率/码率只给累计值**（`232 帧累计` / `7824 KB 累计`）：看不出当下是否卡顿。
+   → 改为每秒差分算**瞬时 fps / kbps**；码率条按 8 Mbps 满格映射。
+3. **缺定位卡顿必需的指标**：新增**丢包率**（`packetsLost/(lost+received)` 占比，>0.5% 黄、>3% 红）、
+   **RTT**（`candidate-pair.currentRoundTripTime`）、**缓冲延迟**（`jitterBufferDelay/jitterBufferEmittedCount`）。
+4. 顺带：日志行加时间戳；新增 **★ 首帧上屏 +N ms**（`requestVideoFrameCallback`，从点「开始接收」到首帧真正上屏），
+   这是接收侧最接近"玻璃"的口径。
+5. CLI 启动时打印全部显示器清单（`[0] … [1] …`），否则接虚拟屏时 `--index` 只能靠猜。
 
-- **回环验证**（`examples/webrtc_loopback.rs`，双 PeerConnection）：
-  ICE Connected → `on_track` 收到视频 → **1830 个 RTP 包 / 2,129,220 字节**，H264Packet 可正确解析；
-- **信令验证**（`scripts/signal_probe.py`）：offer 正常生成并广播（1151 字节，单一 H264 m-line + host candidate）；
-  延迟连接也能收到补发的 offer。
+### 仍未闭合（明确记账）
 
-### 待验证（需真机）
-
-浏览器端出画面：手机打开 `http://<主机IP>:8788/webrtc.html` → 点「开始接收」→ 应看到实时桌面。
-
-## 八、P1.2 WebRTC 最小闭环：本机全通，待真机验证（11-15）
-
-### 已完成
-
-| 组件 | 文件 | 说明 |
-|---|---|---|
-| 会话管理 | `crates/host-win/src/webrtc.rs` | 线程桥接（同步采集 → `sync_channel(2)` → tokio `current_thread` 运行时 → `write_sample`）；有界通道背压丢帧；RTP 时间戳 90kHz |
-| API 构建 | `webrtc::build_api()` | **只注册一种 H.264**（42e01f + packetization-mode=1）+ 禁用 mDNS |
-| 信令 | `serve.rs` Hub | 新增 `broadcast_text` / `poll_inbox` / **信令缓存与新客户端补发**；JSON 手工编解码（`json_escape` 复用 core） |
-| 接收端 | `web/receiver/webrtc.html` | `RTCPeerConnection` + `<video srcObject>`；`playsinline`/`muted`；连接状态与 `getStats()` 展示；需用户点「开始接收」 |
-| CLI | `rs-host stream-webrtc` | 全链路串联；`--fps` 可调 |
-| 启动器 | `scripts/run_stream.cmd --webrtc` | 一键启动 |
-
-### 三个关键实测结论（都是踩出来的）
-
-1. **必须 `create_data_channel` + 等 `gathering_complete_promise`**：否则后台 ICE gathering 不被触发，
-   `local_description` 不含候选，ICE 永远停在 Connecting。标准做法是把**含候选的 SDP** 直接传给对端，
-   不依赖 trickle 转发。（依据 webrtc-rs 官方 `signal_pair` 流程）
-2. **必须禁用 mDNS**：默认模式产生 `.local` 候选，局域网对端无法解析。
-   `SettingEngine::set_ice_multicast_dns_mode(MulticastDnsMode::Disabled)`。
-3. **必须只注册一种 H.264 codec**：`register_default_codecs()` 会注册 6 种 H264 变体，
-   浏览器可能协商到 `42001f`（非 constrained）而编码器输出是 `42e01f`，profile 不匹配会花屏/拒收。
-
-### 本机验证结果
-
-- **回环验证**（`examples/webrtc_loopback.rs`，双 PeerConnection）：
-  ICE Connected → `on_track` 收到视频 → **1830 个 RTP 包 / 2,129,220 字节**，H264Packet 可正确解析；
-- **信令验证**（`scripts/signal_probe.py`）：offer 正常生成并广播（1151 字节，单一 H264 m-line + host candidate）；
-  延迟连接也能收到补发的 offer。
-
-### 待验证（需真机）
-
-浏览器端出画面：手机打开 `http://<主机IP>:8788/webrtc.html` → 点「开始接收」→ 应看到实时桌面。
+- **采集源仍是主屏镜像，不是扩展屏**。`stream-webrtc --index N` 已支持选显示器，
+  下一步用 `--index` 指向虚拟屏（ToDesk 隐私屏「虚拟屏1」已验证可采集）。
+- **端到端（玻璃到玻璃）延迟无度量**：7.57ms 只是"采集→编码出 AU"，不含网络 + 解码 + 上屏。
+  接收端新增的 jitterBuffer / RTT 只是可观测替代品；真闭环仍需**画面内嵌时间戳**方案（下一步做）。
+- 画面在平板上可见轻微块状：当前固定 6000 kbps / 24fps，尚未按设备能力自适应。
