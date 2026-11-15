@@ -13,39 +13,47 @@ use tungstenite::{accept, Message, WebSocket};
 
 type Client = Arc<Mutex<WebSocket<TcpStream>>>;
 
-/// 客户端集合：负责把编码后的访问单元广播给所有接收端。
+/// 客户端唯一标识。用于把信令/会话精确路由到某一个接收端。
+pub type ClientId = u64;
+
+/// 客户端集合：负责把编码后的访问单元广播给所有接收端，
+/// 并为每个客户端提供**定向**信令发送能力（多客户端独立 WebRTC 会话的基础）。
 #[derive(Clone, Default)]
 pub struct Hub {
-    clients: Arc<Mutex<Vec<Client>>>,
+    clients: Arc<Mutex<Vec<(ClientId, Client)>>>,
+    next_id: Arc<AtomicU64>,
     /// 最近一个关键帧访问单元：新客户端接入时立即补发，避免它等到下一个 GOP。
+    /// （仅旧的 WS+WebCodecs 路径使用；WebRTC 路径靠独立会话重建关键帧）
     last_keyframe: Arc<Mutex<Option<Vec<u8>>>>,
-    /// 客户端发来的文本消息（信令回传：answer / ICE candidate）。
-    inbox: Arc<Mutex<Vec<String>>>,
-    /// 客户端代数：每次有新客户端登记就 +1，主线程据此重建 WebRTC 会话。
-    ///
-    /// 这是**替代 offer 缓存**的机制。旧设计把 offer 存起来给新客户端补发，
-    /// 但 PeerConnection 只能协商一次，旧 offer 交给新客户端只会卡在 ICE checking；
-    /// 正确做法是新客户端接入 → 重建 pc → 重新生成 offer。
-    peer_gen: Arc<AtomicU64>,
+    /// 客户端发来的文本消息（信令回传：answer / ICE candidate），带来源客户端 ID。
+    inbox: Arc<Mutex<Vec<(ClientId, String)>>>,
+    /// 新接入的客户端 ID（主线程轮询后为其建立独立 WebRTC 会话）。
+    joined: Arc<Mutex<Vec<ClientId>>>,
+    /// 已断开但尚未清理的客户端 ID（主线程据此销毁对应会话）。
+    disconnected: Arc<Mutex<Vec<ClientId>>>,
 }
 
 impl Hub {
     pub fn new() -> Self {
         Self {
             clients: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
             last_keyframe: Arc::new(Mutex::new(None)),
             inbox: Arc::new(Mutex::new(Vec::new())),
-            peer_gen: Arc::new(AtomicU64::new(0)),
+            joined: Arc::new(Mutex::new(Vec::new())),
+            disconnected: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// 登记新客户端：补发最近关键帧，并把客户端代数 +1（触发会话重建）。
+    /// 登记新客户端，返回其 ID；并把它加入"待建会话"队列。
     ///
-    /// 不再补发旧的 offer：一个 PeerConnection 只能协商一次，
-    /// 把旧 offer 交给新客户端只会让它卡在 ICE checking（实测复现）。
-    /// 新 offer 由主线程检测到代数变化后重建会话时重新生成。
-    fn add(&self, client: Client) {
+    /// 每个客户端都会得到一个**独立的 PeerConnection**（见 webrtc::WebRtcHub），
+    /// 因此新增客户端不再需要"重建全局会话"，也就不会踢掉正在观看的其他客户端
+    /// —— 这是旧 peer_gen 机制反复互相踢的根因。
+    fn add(&self, client: Client) -> ClientId {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         {
+            // 旧的 WS 二进制路径仍需要关键帧补发；WebRTC 路径不受影响
             let kf = self.last_keyframe.lock().unwrap().clone();
             if let Some(data) = kf {
                 if let Ok(mut ws) = client.lock() {
@@ -53,29 +61,53 @@ impl Hub {
                 }
             }
         }
-        self.clients.lock().unwrap().push(client);
-        self.peer_gen.fetch_add(1, Ordering::SeqCst);
+        self.clients.lock().unwrap().push((id, client));
+        self.joined.lock().unwrap().push(id);
+        id
     }
 
-    /// 当前客户端代数。主线程每次轮询都比较，变化即重建会话。
-    pub fn peer_generation(&self) -> u64 {
-        self.peer_gen.load(Ordering::SeqCst)
+    /// 取出所有新接入、尚未建立会话的客户端 ID。
+    pub fn poll_joined(&self) -> Vec<ClientId> {
+        std::mem::take(&mut *self.joined.lock().unwrap())
     }
 
-    /// 记录一条客户端发来的文本消息（信令）。
-    fn push_inbox(&self, text: String) {
-        self.inbox.lock().unwrap().push(text);
+    /// 取出所有已断开、尚未清理会话的客户端 ID（去重）。
+    pub fn poll_disconnected(&self) -> Vec<ClientId> {
+        let mut v = std::mem::take(&mut *self.disconnected.lock().unwrap());
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
-    /// 非阻塞取出所有待处理的信令消息（主线程轮询）。
-    pub fn poll_inbox(&self) -> Vec<String> {
+    /// 标记某客户端已断开（读循环结束、或广播发送失败时调用）。
+    fn mark_disconnected(&self, id: ClientId) {
+        self.disconnected.lock().unwrap().push(id);
+    }
+
+    /// 记录一条客户端发来的文本消息（信令），带来源 ID。
+    fn push_inbox(&self, id: ClientId, text: String) {
+        self.inbox.lock().unwrap().push((id, text));
+    }
+
+    /// 非阻塞取出所有待处理的信令消息及其来源客户端（主线程轮询）。
+    pub fn poll_inbox(&self) -> Vec<(ClientId, String)> {
         std::mem::take(&mut *self.inbox.lock().unwrap())
     }
 
+    /// 定向发送一段文本（JSON 信令）给指定客户端。返回是否成功。
+    pub fn send_to(&self, id: ClientId, text: &str) -> bool {
+        let clients = self.clients.lock().unwrap();
+        let Some((_, c)) = clients.iter().find(|(cid, _)| *cid == id) else {
+            return false;
+        };
+        let mut ws = match c.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        ws.send(Message::Text(text.to_string())).is_ok()
+    }
+
     /// 广播一段文本（JSON 信令），不写缓存。返回 (成功数, 断开数)。
-    ///
-    /// offer 与 candidate 都走这里：补发不靠缓存，靠"客户端代数 → 重建会话"
-    /// （见 `peer_gen`）。这样不存在把过期 offer 塞给新客户端的问题。
     pub fn broadcast_text(&self, text: &str) -> (usize, usize) {
         self.broadcast_raw(Message::Text(text.to_string()))
     }
@@ -100,22 +132,23 @@ impl Hub {
         let mut alive = Vec::with_capacity(clients.len());
         let mut ok = 0usize;
         let mut dead = 0usize;
-        for c in clients.drain(..) {
+        for (id, c) in clients.drain(..) {
             let sent = {
                 let mut ws = c.lock().unwrap();
                 match ws.send(msg.clone()) {
                     Ok(()) => true,
                     Err(e) => {
-                        eprintln!("[ws] 发送失败，移除客户端: {e}");
+                        eprintln!("[ws] 发送失败，移除客户端 #{id}: {e}");
                         false
                     }
                 }
             };
             if sent {
                 ok += 1;
-                alive.push(c);
+                alive.push((id, c));
             } else {
                 dead += 1;
+                self.mark_disconnected(id);
             }
         }
         *clients = alive;
@@ -145,7 +178,7 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
                         .get_ref()
                         .set_read_timeout(Some(Duration::from_millis(20)));
                     let client: Client = Arc::new(Mutex::new(ws));
-                    hub.add(client.clone());
+                    let id = hub.add(client.clone());
                     // 持续读取客户端消息（信令回传：answer / ICE candidate）
                     loop {
                         let msg = {
@@ -166,14 +199,17 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
                             }
                         };
                         match msg {
-                            Message::Text(t) => hub.push_inbox(t),
+                            Message::Text(t) => hub.push_inbox(id, t),
                             Message::Binary(b) => {
-                                hub.push_inbox(String::from_utf8_lossy(&b).to_string())
+                                hub.push_inbox(id, String::from_utf8_lossy(&b).to_string())
                             }
                             Message::Close(_) => break,
                             _ => {}
                         }
                     }
+                    // 读循环结束 = 客户端断开：登记到 disconnected，
+                    // 主线程据此销毁该客户端独有的 WebRTC 会话。
+                    hub.mark_disconnected(id);
                 }
             });
         }

@@ -16,6 +16,10 @@
   video { width: 100%; height: auto; background: #000; border-radius: 8px; display: block; }
   #start { display: block; width: 100%; max-width: 420px; margin: 40px auto; padding: 16px; font-size: 16px;
            background: #1a73e8; color: #fff; border: 0; border-radius: 10px; }
+  .tool { display: none; margin: 8px auto 0; padding: 8px 14px; font-size: 13px;
+          background: #26282e; color: #e8eaed; border: 0; border-radius: 8px; }
+  /* 1:1 原始尺寸模式：不做任何缩放，用于排除非整数倍缩放带来的采样抖动 */
+  video.native { width: auto !important; height: auto !important; max-width: none; }
   .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
   .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
   #log { margin-top: 12px; color: #9aa0a6; font-size: 12px; white-space: pre-wrap; max-height: 30vh; overflow: auto; }
@@ -40,6 +44,7 @@
 <div id="stage">
   <video id="v" playsinline webkit-playsinline muted autoplay></video>
   <button id="start">点击开始接收</button>
+  <button id="native" class="tool">1:1 原始尺寸</button>
   <div class="bar"><i id="bar"></i></div>
   <div id="log"></div>
 </div>
@@ -264,8 +269,17 @@ el('start').addEventListener('click', () => {
   started = true;
   tStart = performance.now();
   el('start').style.display = 'none';
+  el('native').style.display = 'block';
   L('用户已确认开始接收');
   connectSignaling();
+});
+
+// 1:1 原始尺寸切换：排除「非整数倍缩放」导致的运动采样抖动。
+// width:100% 时 800px 的视频会被拉伸到屏幕宽度（例如 1200px = 1.5 倍），
+// 非整数缩放会在运动时产生轻微的位置抖动/边缘呼吸。
+el('native').addEventListener('click', () => {
+  const on = video.classList.toggle('native');
+  L('显示模式：' + (on ? '1:1 原始尺寸（不缩放）' : '自适应宽度（缩放显示）'));
 });
 </script>
 </body>

@@ -315,6 +315,7 @@ pub fn capture_stream<F>(
     height: u32,
     duration_ms: u64,
     target_fps: u32,
+    include_cursor: bool,
     mut on_frame: F,
 ) -> Result<CaptureStats, String>
 where
@@ -343,6 +344,12 @@ where
         let session = pool
             .CreateCaptureSession(&item)
             .map_err(|e| format!("创建 GraphicsCaptureSession 失败: {e}"))?;
+        // 是否把鼠标光标合成进画面（WGC 默认 true）。
+        // 光标是独立图层，在帧捕获瞬间合成；虚拟显示器上可能出现位置抖动，
+        // 用 `--no-cursor` 关闭可做对照排查。老系统不支持该方法时忽略。
+        if let Err(e) = session.SetIsCursorCaptureEnabled(include_cursor) {
+            eprintln!("[capture] 设置光标捕获失败（忽略）: {e}");
+        }
         session
             .StartCapture()
             .map_err(|e| format!("StartCapture 失败: {e}"))?;

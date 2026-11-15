@@ -27,9 +27,10 @@
 //! - **`ice_servers: []`**：首版只收 host candidate，不做 STUN/TURN；
 //! - **RTP 时间戳 90kHz**：与 `clock_rate` 一致，按目标帧率递增。
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +44,8 @@ use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use crate::serve::ClientId;
 
 /// 抽取 SDP 里与"通道是否真的建立"相关的行，压成一行便于日志比对。
 ///
@@ -198,38 +201,75 @@ pub enum SignalIn {
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u16>,
     },
-    /// 重建会话：有新的接收端接入时由主线程投递。
+    /// 结束本会话（客户端断开或服务停止）。
     ///
-    /// 一个 PeerConnection 只能完成一次 offer/answer 协商——接收端关掉页面再连，
-    /// 复用旧的 pc/offer 会让 ICE 永远停在 checking（实测 14:29 那次就是这样）。
-    /// 因此新客户端必须重建 pc 并重新生成 offer。
-    Restart,
+    /// 不再有 `Restart`：每个客户端一个独立 PeerConnection，
+    /// 新客户端接入只需新建会话，不必打断任何已有会话。
     Shutdown,
 }
 
-/// WebRTC 会话句柄（同步线程持有）。
-pub struct WebRtcHandle {
-    /// 送帧通道（同步线程 → tokio 线程），容量 2，满则丢帧
+/// 单个客户端会话的内部句柄。
+struct SessionHandle {
+    /// 送帧通道（同步线程 → 该会话的 tokio 线程），容量 2，满则丢帧
     frame_tx: SyncSender<Vec<u8>>,
-    /// 信令输出（主线程轮询）
-    signal_out_rx: Receiver<SignalOut>,
     /// 信令输入（主线程投递）
     signal_in_tx: tokio::sync::mpsc::Sender<SignalIn>,
 }
 
-impl WebRtcHandle {
-    /// 启动 WebRTC 会话（spawn tokio 线程）。
-    ///
-    /// `fps`：目标帧率，用于计算 RTP 时间戳增量与 sample duration。
-    pub fn spawn(fps: u32) -> Result<Self, String> {
+/// 多客户端 WebRTC 会话管理器（同步线程持有）。
+///
+/// **每个客户端一个独立 PeerConnection**：新客户端接入只新建会话，
+/// 不触碰已有会话，因此不会出现旧的"新客户端把正在看的客户端踢掉"的问题
+/// （那是单 pc 共享会话架构的必然结果）。
+///
+/// 视频帧只编码一次，通过有界通道分发给各会话；每个会话独立打包成 RTP 发出。
+pub struct WebRtcHub {
+    fps: u32,
+    sessions: Arc<Mutex<HashMap<ClientId, SessionHandle>>>,
+    /// 汇总所有会话的信令输出，带上来源客户端 ID。
+    /// `Receiver` 不是 Sync，而 Hub 需跨线程共享（采集线程 push_frame、
+    /// 信令泵线程 poll_signal），故用 Mutex 包一层。
+    signal_out_rx: Mutex<Receiver<(ClientId, SignalOut)>>,
+    signal_out_tx: Sender<(ClientId, SignalOut)>,
+}
+
+impl WebRtcHub {
+    /// 创建会话管理器。`fps` 用于各会话计算 RTP 时间戳增量。
+    pub fn new(fps: u32) -> Self {
+        let (signal_out_tx, signal_out_rx) = std::sync::mpsc::channel::<(ClientId, SignalOut)>();
+        Self {
+            fps,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            signal_out_rx: Mutex::new(signal_out_rx),
+            signal_out_tx,
+        }
+    }
+
+    /// 为新接入的客户端建立独立会话。
+    pub fn join(&self, id: ClientId) -> Result<(), String> {
+        if self.sessions.lock().unwrap().contains_key(&id) {
+            return Ok(()); // 幂等：同一客户端重复登记不重建
+        }
+        let fps = self.fps;
         let (frame_tx, frame_rx) = sync_channel::<Vec<u8>>(2);
-        let (signal_out_tx, signal_out_rx) = std::sync::mpsc::channel::<SignalOut>();
-        // 信令输入走 tokio mpsc：主循环要用 select! 同时等信令和发送节拍，
-        // std mpsc 的 recv() 不是 Future 进不了 select；同步侧用 blocking_send 投递。
         let (signal_in_tx, signal_in_rx) = tokio::sync::mpsc::channel::<SignalIn>(32);
+        // 每个会话有独立的 SignalOut 通道（不带 id），由转发线程补上 id 汇入总通道。
+        // 这样 run_once 内部完全不需要感知 client_id，改动面最小。
+        let (sess_out_tx, sess_out_rx) = std::sync::mpsc::channel::<SignalOut>();
+        let hub_out = self.signal_out_tx.clone();
+        thread::Builder::new()
+            .name(format!("webrtc-fwd-{id}"))
+            .spawn(move || {
+                for s in sess_out_rx {
+                    if hub_out.send((id, s)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn 信令转发线程失败: {e}"))?;
 
         thread::Builder::new()
-            .name("webrtc-session".into())
+            .name(format!("webrtc-{id}"))
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -237,104 +277,85 @@ impl WebRtcHandle {
                 {
                     Ok(rt) => rt,
                     Err(e) => {
-                        let _ = signal_out_tx.send(SignalOut::State(format!(
-                            "tokio 运行时创建失败: {e}"
-                        )));
+                        let _ = sess_out_tx
+                            .send(SignalOut::State(format!("tokio 运行时创建失败: {e}")));
                         return;
                     }
                 };
+                let mut rx = signal_in_rx;
                 rt.block_on(async move {
-                    if let Err(e) = run_session(fps, frame_rx, signal_out_tx.clone(), signal_in_rx).await
-                    {
-                        let _ = signal_out_tx.send(SignalOut::State(format!("会话错误: {e}")));
+                    if let Err(e) = run_once(fps, &frame_rx, &sess_out_tx, &mut rx).await {
+                        let _ = sess_out_tx.send(SignalOut::State(format!("会话错误: {e}")));
                     }
                 });
             })
-            .map_err(|e| format!("spawn webrtc 线程失败: {e}"))?;
+            .map_err(|e| format!("spawn webrtc 会话线程失败: {e}"))?;
 
-        Ok(Self {
-            frame_tx,
-            signal_out_rx,
-            signal_in_tx,
-        })
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(id, SessionHandle { frame_tx, signal_in_tx });
+        Ok(())
     }
 
-    /// 送入一帧 H.264 访问单元（Annex B）。返回 `false` 表示因背压被丢弃。
-    pub fn push_frame(&self, au: &[u8]) -> bool {
-        match self.frame_tx.try_send(au.to_vec()) {
-            Ok(()) => true,
-            Err(std::sync::mpsc::TrySendError::Full(_)) => false,
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    /// 客户端断开：移除并结束它的会话。其他会话不受影响。
+    pub fn leave(&self, id: ClientId) {
+        if let Some(s) = self.sessions.lock().unwrap().remove(&id) {
+            let _ = s.signal_in_tx.blocking_send(SignalIn::Shutdown);
         }
     }
 
-    /// 非阻塞取一条待发送的信令。
-    pub fn poll_signal(&self) -> Option<SignalOut> {
-        self.signal_out_rx.try_recv().ok()
-    }
-
-    /// 投递浏览器回传的信令（在同步线程调用）。
-    pub fn deliver(&self, sig: SignalIn) {
-        let _ = self.signal_in_tx.blocking_send(sig);
-    }
-
-    /// 请求重建会话（有新接收端接入时调用）。
-    pub fn restart(&self) {
-        let _ = self.signal_in_tx.blocking_send(SignalIn::Restart);
-    }
-
-    /// 关闭会话。
-    pub fn close(&self) {
-        let _ = self.signal_in_tx.blocking_send(SignalIn::Shutdown);
-    }
-}
-
-/// 一次 pc 生命周期的结束原因。
-enum SessionEnd {
-    /// 收到 Shutdown，或采集端已关闭
-    Shutdown,
-    /// 需要重建（有新接收端接入）
-    Restart,
-}
-
-/// tokio 线程内的会话主循环：外层负责重建，内层跑一次完整的 pc 生命周期。
-///
-/// 拆两层的原因：PeerConnection 完成一次 offer/answer 后不能再接受新的 answer
-/// （会报 `invalid proposed signaling state transition from stable applying remote answer`），
-/// 而接收端随时可能关页面重连。只有换一个全新的 pc 才能重新协商。
-async fn run_session(
-    fps: u32,
-    frame_rx: Receiver<Vec<u8>>,
-    signal_out_tx: Sender<SignalOut>,
-    mut signal_in_rx: tokio::sync::mpsc::Receiver<SignalIn>,
-) -> Result<(), String> {
-    let mut round: u32 = 0;
-    loop {
-        round += 1;
-        match run_once(fps, &frame_rx, &signal_out_tx, &mut signal_in_rx).await? {
-            SessionEnd::Shutdown => return Ok(()),
-            SessionEnd::Restart => {
-                let _ = signal_out_tx.send(SignalOut::State(format!(
-                    "接收端重连：重建 PeerConnection（第 {round} 轮）并重新生成 offer"
-                )));
-                // 清掉通道里积压的 Restart/Shutdown（主线程可能连投了多次），
-                // 否则新会话一进 select 循环就被旧的 Restart 打断，又立刻退出，
-                // 表现为"检测到第 N 次接入"却始终不产 offer（客户端永远等 offer）。
-                // Answer/Candidate 属于旧会话，一并丢弃（新 offer 会触发新 answer）。
-                while signal_in_rx.try_recv().is_ok() {}
+    /// 把一帧 H.264 访问单元分发给所有活跃会话。返回成功入队的会话数。
+    ///
+    /// 用 `try_send`：某个会话消费不过来时只丢它自己的帧，不阻塞采集线程，
+    /// 也不影响其他会话。
+    pub fn push_frame(&self, au: &[u8]) -> usize {
+        let sessions = self.sessions.lock().unwrap();
+        let mut ok = 0;
+        for s in sessions.values() {
+            if s.frame_tx.try_send(au.to_vec()).is_ok() {
+                ok += 1;
             }
         }
+        ok
+    }
+
+    /// 把浏览器回传的信令投递给指定客户端的会话。
+    pub fn deliver(&self, id: ClientId, sig: SignalIn) {
+        if let Some(s) = self.sessions.lock().unwrap().get(&id) {
+            let _ = s.signal_in_tx.blocking_send(sig);
+        }
+    }
+
+    /// 非阻塞取一条会话输出信令（含来源客户端 ID）。
+    pub fn poll_signal(&self) -> Option<(ClientId, SignalOut)> {
+        self.signal_out_rx.lock().ok()?.try_recv().ok()
+    }
+
+    /// 当前活跃会话数。
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    /// 关闭所有会话（服务退出时调用）。
+    pub fn close_all(&self) {
+        let sessions = std::mem::take(&mut *self.sessions.lock().unwrap());
+        for (_, s) in sessions {
+            let _ = s.signal_in_tx.blocking_send(SignalIn::Shutdown);
+        }
     }
 }
 
-/// 一次 pc 生命周期：建 pc → 发 offer → 收发信令与帧，直到 Shutdown / Restart。
+/// 一次 pc 生命周期：建 pc → 发 offer → 收发信令与帧，直到 Shutdown。
+///
+/// 会话寿命 = 客户端连接寿命，不再有"重建轮次"。
 async fn run_once(
     fps: u32,
     frame_rx: &Receiver<Vec<u8>>,
     signal_out_tx: &Sender<SignalOut>,
     signal_in_rx: &mut tokio::sync::mpsc::Receiver<SignalIn>,
-) -> Result<SessionEnd, String> {
-    // 会话重建的计时起点：用来定位"客户端点开始 → 首帧上屏"这 1.2 秒花在哪一段
+) -> Result<(), String> {
+    // 会话计时起点：用来定位"客户端点开始 → 首帧上屏"这 1.2 秒花在哪一段
     let t0 = std::time::Instant::now();
 
     // 注意：这里**不能**盲目 try_recv 丢弃残留信令。
@@ -547,19 +568,15 @@ async fn run_once(
                                     .send(SignalOut::State(format!("add_ice_candidate: {e}")));
                             }
                         }
-                        SignalIn::Restart => {
-                            let _ = pc.close().await;
-                            return Ok(SessionEnd::Restart);
-                        }
                         SignalIn::Shutdown => {
                             let _ = pc.close().await;
-                            return Ok(SessionEnd::Shutdown);
+                            return Ok(());
                         }
                     },
                     None => {
-                        // 通道断开（主线程 drop 了句柄）
+                        // 通道断开（会话被移除或进程退出）
                         let _ = pc.close().await;
-                        return Ok(SessionEnd::Shutdown);
+                        return Ok(());
                     }
                 }
             }
@@ -607,7 +624,7 @@ async fn run_once(
                     }
                     Err(TryRecvError::Disconnected) => {
                         let _ = pc.close().await;
-                        return Ok(SessionEnd::Shutdown);
+                        return Ok(());
                     }
                 }
             }

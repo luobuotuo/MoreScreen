@@ -316,6 +316,7 @@ fn main() {
                     target.mode.height,
                     seconds * 1000,
                     cfg.fps,
+                    true, // 旧 WS 路径固定包含光标
                     |bgra| {
                         let t_capture = t_origin.elapsed().as_nanos() as u64;
                         let queued = enc2.push_frame(bgra)?;
@@ -531,6 +532,14 @@ fn main() {
             }
             println!("采集目标    : {}", target.label());
 
+            // 是否把鼠标光标合成进画面（WGC 默认 true）。
+            // 某些虚拟显示器上光标位置会抖动，用 `--no-cursor` 可对照排查。
+            let include_cursor = !args.iter().any(|a| a == "--no-cursor");
+            println!(
+                "光标捕获    : {}",
+                if include_cursor { "开启（默认）" } else { "关闭（--no-cursor）" }
+            );
+
             let cfg = remote_screen_host_win::encode::EncodeConfig {
                 width: target.mode.width.max(16),
                 height: target.mode.height.max(16),
@@ -556,20 +565,15 @@ fn main() {
                 }
             };
 
-            // WebRTC 会话（spawn tokio 线程）
-            let rtc = std::sync::Arc::new(std::sync::Mutex::new(
-                match remote_screen_host_win::webrtc::WebRtcHandle::spawn(fps) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("WebRTC 会话启动失败: {e}");
-                        std::process::exit(7);
-                    }
-                },
-            ));
+            // WebRTC 会话管理器：每个客户端一个独立 PeerConnection，
+            // 新客户端接入只新建会话，不影响已在观看的客户端。
+            let rtc = std::sync::Arc::new(
+                remote_screen_host_win::webrtc::WebRtcHub::new(fps),
+            );
 
             // ---- 信令泵：独立线程 ----
             // 不能挂在采集回调上：虚拟屏静止时 WGC 可能很久才给一帧，
-            // 而"新客户端接入 → 重建会话 → 下发 offer"绝不能等帧
+            // 而"新客户端接入 → 建会话 → 下发 offer"绝不能等帧
             // （实测：屏静止时回调几分钟不触发，客户端会一直卡在"等待 offer"）。
             // 另一个好处：广播变慢也不会拖住采集主循环。
             {
@@ -577,69 +581,61 @@ fn main() {
                 let hub_pump = hub.clone();
                 std::thread::spawn(move || {
                     use remote_screen_host_win::webrtc::SignalOut;
-                    let mut last_gen = hub_pump.peer_generation();
-                    let mut last_restart = std::time::Instant::now()
-                        - std::time::Duration::from_secs(10);
                     loop {
-                        // 1) 新客户端接入 → 重建会话（一个 pc 只能协商一次）
-                        let gen = hub_pump.peer_generation();
-                        if gen != last_gen {
-                            last_gen = gen;
-                            // 防抖：restart 后 500ms 内忽略新的接入，
-                            // 避免"重建动作本身触发 generation 变化 → 再 restart"的死循环。
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_restart)
-                                > std::time::Duration::from_millis(500)
-                            {
-                                last_restart = now;
-                                println!("[webrtc] 检测到第 {gen} 次客户端接入，重建会话");
-                                if let Ok(h) = rtc.lock() {
-                                    h.restart();
-                                }
+                        // 1) 新客户端接入 → 为它单独建一个会话
+                        for id in hub_pump.poll_joined() {
+                            println!("[webrtc] 客户端 #{id} 接入，建立独立会话");
+                            if let Err(e) = rtc.join(id) {
+                                eprintln!("[webrtc] 客户端 #{id} 建会话失败: {e}");
                             }
                         }
-                        // 2) 会话 → 浏览器：offer / candidate（先在锁内取出，再在锁外广播）
-                        let sigs: Vec<SignalOut> = {
-                            let h = match rtc.lock() {
-                                Ok(h) => h,
-                                Err(_) => break,
-                            };
-                            let mut v = Vec::new();
-                            while let Some(s) = h.poll_signal() {
-                                v.push(s);
-                            }
-                            v
-                        };
-                        for sig in sigs {
+                        // 2) 客户端断开 → 销毁它的会话（其他会话不受影响）
+                        for id in hub_pump.poll_disconnected() {
+                            println!("[webrtc] 客户端 #{id} 断开，销毁会话");
+                            rtc.leave(id);
+                        }
+                        // 3) 会话 → 浏览器：offer / candidate，**定向**发给所属客户端
+                        let mut sigs = Vec::new();
+                        while let Some(s) = rtc.poll_signal() {
+                            sigs.push(s);
+                        }
+                        for (id, sig) in sigs {
                             match sig {
                                 SignalOut::Offer { sdp } => {
-                                    let (ok, dead) = hub_pump.broadcast_text(&format!(
-                                        "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
-                                        json_escape(&sdp)
-                                    ));
-                                    println!("[webrtc] offer 已发送：成功 {ok} 个，断开 {dead} 个");
+                                    let ok = hub_pump.send_to(
+                                        id,
+                                        &format!(
+                                            "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
+                                            json_escape(&sdp)
+                                        ),
+                                    );
+                                    println!(
+                                        "[webrtc] 客户端 #{id} offer 已发送：{}",
+                                        if ok { "成功" } else { "失败（连接已断）" }
+                                    );
                                 }
                                 SignalOut::Candidate {
                                     candidate,
                                     sdp_mid,
                                     sdp_mline_index,
                                 } => {
-                                    hub_pump.broadcast_text(&format!(
-                                        "{{\"t\":\"webrtc-cand\",\"candidate\":\"{}\",\"sdpMid\":\"{}\",\"sdpMLineIndex\":{}}}",
-                                        json_escape(&candidate),
-                                        sdp_mid.clone().unwrap_or_default(),
-                                        sdp_mline_index.unwrap_or(0)
-                                    ));
+                                    hub_pump.send_to(
+                                        id,
+                                        &format!(
+                                            "{{\"t\":\"webrtc-cand\",\"candidate\":\"{}\",\"sdpMid\":\"{}\",\"sdpMLineIndex\":{}}}",
+                                            json_escape(&candidate),
+                                            sdp_mid.clone().unwrap_or_default(),
+                                            sdp_mline_index.unwrap_or(0)
+                                        ),
+                                    );
                                 }
-                                SignalOut::State(s) => println!("[webrtc] {s}"),
+                                SignalOut::State(s) => println!("[webrtc] #{id} {s}"),
                             }
                         }
-                        // 3) 浏览器 → 会话：answer / candidate
-                        for text in hub_pump.poll_inbox() {
+                        // 4) 浏览器 → 会话：answer / candidate，定向投递给所属会话
+                        for (id, text) in hub_pump.poll_inbox() {
                             if let Some(sig) = parse_signal_json(&text) {
-                                if let Ok(h) = rtc.lock() {
-                                    h.deliver(sig);
-                                }
+                                rtc.deliver(id, sig);
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -658,6 +654,7 @@ fn main() {
                 target.mode.height,
                 seconds * 1000,
                 fps,
+                include_cursor,
                 |bgra| {
                     let queued = enc2.push_frame(bgra)?;
                     if !queued {
@@ -665,19 +662,15 @@ fn main() {
                     }
                     let chunks = enc2.read_chunks()?;
                     for c in chunks {
-                        // WebRTC 模式送原始 AU（不带标记位），packetization 交给 H264Payloader
-                        if let Ok(h) = rtc.lock() {
-                            h.push_frame(&c.data);
-                        }
+                        // 编码只做一次，分发给所有活跃会话（各会话独立打包成 RTP）
+                        rtc.push_frame(&c.data);
                         au_count += 1;
                     }
                     Ok(())
                 },
             );
 
-            if let Ok(h) = rtc.lock() {
-                h.close();
-            }
+            rtc.close_all();
             match res {
                 Ok(stats) => {
                     println!(
