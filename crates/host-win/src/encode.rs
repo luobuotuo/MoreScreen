@@ -125,6 +125,11 @@ impl FfmpegEncoder {
             cfg.pix_fmt.clone(),
             "-s".into(),
             format!("{}x{}", cfg.width, cfg.height),
+            // 恢复 `-r`：WebRTC 层的节拍器已保证 CFR 输出节奏，
+            // 编码器侧再用 wallclock 会引入两套独立时钟（wallclock PTS vs RTP 节拍），
+            // 反而制造 micro-burst——节拍器排空队列时出现"0 帧/2 帧"的取帧抖动，
+            // 这正是 jitterBuffer 判定"迟到 120ms"并持续丢帧的来源。
+            // 用固定 -r 让 ffmpeg 按 CFR 打 PTS，与节拍器节奏对齐。
             "-r".into(),
             cfg.fps.to_string(),
             "-i".into(),

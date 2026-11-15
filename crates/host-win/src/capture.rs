@@ -53,6 +53,94 @@ pub struct CaptureStats {
     pub nv12_path: Option<String>,
 }
 
+/// 采集帧率诊断：抓取指定时长，把每一帧的到达时刻与帧间隔落盘，
+/// 用于定位"丢帧发生在采集侧还是传输侧"。
+///
+/// 这是独立于 stream 链路的纯采集测量：跳过编码与 WebRTC，
+/// 只记录 `TryGetNextFrame` 拿到帧的时刻。若这里就出现大间隔/丢帧，
+/// 问题在 WGC 采集；若这里平滑，问题在后面的编码/传输。
+pub fn diagnose_capture(
+    bounds_x: i32,
+    bounds_y: i32,
+    width: u32,
+    height: u32,
+    duration_ms: u64,
+    target_fps: u32,
+    out_path: &Path,
+) -> Result<String, String> {
+    unsafe {
+        let hmonitor = monitor_from_bounds(bounds_x, bounds_y, width, height);
+        if hmonitor.0.is_null() {
+            return Err("MonitorFromPoint 未返回有效 HMONITOR".into());
+        }
+        let (d3d_device, d3d_context, winrt_device) = create_device()?;
+        let interop: IGraphicsCaptureItemInterop =
+            factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                .map_err(|e| format!("获取 IGraphicsCaptureItemInterop 失败: {e}"))?;
+        let item: GraphicsCaptureItem = interop
+            .CreateForMonitor(hmonitor)
+            .map_err(|e| format!("CreateForMonitor 失败: {e}"))?;
+        let size = SizeInt32 { Width: width as i32, Height: height as i32 };
+        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &winrt_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            size,
+        )
+        .map_err(|e| format!("创建帧池失败: {e}"))?;
+        let session = pool.CreateCaptureSession(&item).map_err(|e| format!("创建会话失败: {e}"))?;
+        session.StartCapture().map_err(|e| format!("StartCapture 失败: {e}"))?;
+
+        let start = Instant::now();
+        let mut last_ts: Option<Instant> = None;
+        let mut last_push: Option<Instant> = None;
+        let mut accepted = 0u64;
+        let mut skipped = 0u64;
+        let min_interval = std::time::Duration::from_micros(1_000_000 / target_fps.max(1) as u64 * 9 / 10);
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("idx\tarrival_ms\tinterval_ms\taccepted".to_string());
+
+        while (start.elapsed().as_millis() as u64) < duration_ms {
+            match pool.TryGetNextFrame() {
+                Ok(_frame) => {
+                    let now = Instant::now();
+                    let interval = last_ts
+                        .map(|t| now.duration_since(t).as_secs_f64() * 1000.0)
+                        .unwrap_or(0.0);
+                    last_ts = Some(now);
+                    let accept = match last_push {
+                        Some(lp) if now.duration_since(lp) < min_interval => false,
+                        _ => true,
+                    };
+                    if accept {
+                        last_push = Some(now);
+                        accepted += 1;
+                    } else {
+                        skipped += 1;
+                    }
+                    lines.push(format!(
+                        "{}\t{:.2}\t{:.2}\t{}",
+                        accepted + skipped,
+                        now.duration_since(start).as_secs_f64() * 1000.0,
+                        interval,
+                        accept
+                    ));
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
+        let _ = session.Close();
+        let _ = d3d_context;
+        let _ = d3d_device;
+        std::fs::write(out_path, lines.join("\n")).map_err(|e| format!("写诊断文件失败: {e}"))?;
+        Ok(format!(
+            "采集诊断完成：共拿到 {} 帧，接受 {accepted}，限速跳过 {skipped}，已写入 {}",
+            accepted + skipped,
+            out_path.display()
+        ))
+    }
+}
+
 /// 创建一个 D3D11 设备 + 立即上下文，并包装成 WinRT `IDirect3DDevice`（WGC 需要）。
 unsafe fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext, IDirect3DDevice), String> {
     let feature_levels = [
@@ -265,7 +353,10 @@ where
         // 帧率限速：采集频率（显示器刷新率）常高于编码目标帧率，
         // 不限速会让编码器按错误的时间基播放，画面节奏失真。
         let min_interval = if target_fps > 0 {
-            std::time::Duration::from_micros(1_000_000 / target_fps as u64)
+            // 阈值必须留容差。60Hz 源 + 50ms（20fps）阈值太贴边：第 3 帧恰好落在
+            // 50.0ms，抖动一点点就判不过，只能等第 4 帧（66.7ms）→ 实测掉到 16.7fps。
+            // 打九折成 45ms，第 3 帧稳定通过，实际帧率回到 20fps。
+            std::time::Duration::from_micros(1_000_000 / target_fps as u64 * 9 / 10)
         } else {
             std::time::Duration::from_micros(0)
         };

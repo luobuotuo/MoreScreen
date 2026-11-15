@@ -7,3 +7,4 @@ out/
 tools/vdd-driver*
 tools/*.zip
 tools/ffmpeg/
+.playwright-cli/

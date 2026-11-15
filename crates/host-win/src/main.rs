@@ -158,6 +158,31 @@ fn main() {
                 }
             }
         }
+        "capture-diag" => {
+            let displays = enumerate_displays();
+            let want = arg_value(&args, "--display");
+            let index = arg_value(&args, "--index")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let (_, target) = match pick_display(&displays, index, want.as_deref()) {
+                Some(v) => v,
+                None => {
+                    eprintln!("未找到显示目标");
+                    std::process::exit(2);
+                }
+            };
+            let seconds = arg_value(&args, "--seconds").and_then(|v| v.parse::<u64>().ok()).unwrap_or(30);
+            let fps = arg_value(&args, "--fps").and_then(|v| v.parse::<u32>().ok()).unwrap_or(20);
+            let out = arg_value(&args, "--out").unwrap_or_else(|| "out/capture_diag.tsv".to_string());
+            println!("目标: {}", target.label());
+            match remote_screen_host_win::capture::diagnose_capture(
+                target.bounds.x, target.bounds.y, target.mode.width, target.mode.height,
+                seconds * 1000, fps, std::path::Path::new(&out),
+            ) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => { eprintln!("采集诊断失败: {e}"); std::process::exit(1); }
+            }
+        }
         "stream" => {
             // 采集 -> H.264 编码 -> WebSocket 广播 -> 浏览器解码
             let ws_port = arg_value(&args, "--port")
@@ -438,9 +463,20 @@ fn main() {
             let seconds = arg_value(&args, "--seconds")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60);
+            // 帧率必须能整除显示器刷新率（虚拟屏是 60Hz）。
+            // 24fps 需要 41.6ms 间隔，而 60Hz 只给 16.67/33.3/50ms 三个落点 →
+            // 实测永远只出 20fps（60/3），且 RTP 时间戳仍按 24fps 递增，
+            // 时间基比实际快 20%，接收端 jitterBuffer 因此堆到 90ms+。
+            // 20fps = 60/3，时间戳与实际完全对齐。
             let fps: u32 = arg_value(&args, "--fps")
                 .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(24);
+                .unwrap_or(20);
+            // 码率必须显式给：QSV 在 6000kbps 目标下遇到 I 帧密集会冲到 2.6Mbps，
+            // 直接把平板 Wi-Fi（实测有效 ~1.6Mbps）塞满 → 1% 丢包 + 掉帧。
+            // 800x600 静态桌面 800kbps 够用。
+            let bitrate: u32 = arg_value(&args, "--bitrate")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(800);
 
             let ffmpeg = match resolve_ffmpeg() {
                 Some(p) => p,
@@ -467,29 +503,49 @@ fn main() {
             println!("等待接收端连接…（页面需点「开始接收」）");
 
             let displays = enumerate_displays();
-            // 打印全部目标：虚拟屏接入后需要靠 --index 选，不列出来只能靠猜
+            // 打印全部目标：不列出来只能靠猜
             for (i, d) in displays.iter().enumerate() {
                 println!("  [{i}] {}", d.label());
             }
-            let target = match displays.get(index) {
-                Some(d) => d,
+            let want = arg_value(&args, "--display");
+            let (index, target) = match pick_display(&displays, index, want.as_deref()) {
+                Some(v) => v,
                 None => {
-                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    eprintln!(
+                        "未找到匹配的显示目标（--display {:?}，共 {} 个）",
+                        want,
+                        displays.len()
+                    );
                     std::process::exit(2);
                 }
             };
+            // 0x0 的未点亮目标采不出画面：以前会静默退成 16x16 空转，看着像在跑
+            if !target.is_active || target.mode.width == 0 || target.mode.height == 0 {
+                eprintln!(
+                    "显示目标 [{index}] {} 未点亮（{}x{}），无法采集",
+                    target.label(),
+                    target.mode.width,
+                    target.mode.height
+                );
+                std::process::exit(2);
+            }
             println!("采集目标    : {}", target.label());
 
             let cfg = remote_screen_host_win::encode::EncodeConfig {
                 width: target.mode.width.max(16),
                 height: target.mode.height.max(16),
                 fps,
-                bitrate_kbps: 6000,
+                bitrate_kbps: bitrate,
+                // GOP 保持 1 秒。曾缩到 0.5 秒想改善首帧，结果 I 帧翻倍把码率推到
+                // 2.6Mbps、丢包恶化 —— 首帧该在"会话重建时强制 IDR"上解决，不是拿稳态码率换。
                 gop: fps,
                 pix_fmt: "bgra".into(),
             };
             let encoder = remote_screen_host_win::encode::detect_encoder(&ffmpeg);
-            println!("编码器      : {}  目标帧率: {} fps", encoder, fps);
+            println!(
+                "编码器      : {}  目标帧率: {} fps  目标码率: {} kbps  GOP: {} 帧",
+                encoder, fps, bitrate, cfg.gop
+            );
             let enc = match remote_screen_host_win::encode::FfmpegEncoder::start(
                 &cfg, &ffmpeg, &encoder,
             ) {
@@ -501,15 +557,96 @@ fn main() {
             };
 
             // WebRTC 会话（spawn tokio 线程）
-            let rtc = match remote_screen_host_win::webrtc::WebRtcHandle::spawn(fps) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("WebRTC 会话启动失败: {e}");
-                    std::process::exit(7);
-                }
-            };
+            let rtc = std::sync::Arc::new(std::sync::Mutex::new(
+                match remote_screen_host_win::webrtc::WebRtcHandle::spawn(fps) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("WebRTC 会话启动失败: {e}");
+                        std::process::exit(7);
+                    }
+                },
+            ));
 
-            let hub2 = hub.clone();
+            // ---- 信令泵：独立线程 ----
+            // 不能挂在采集回调上：虚拟屏静止时 WGC 可能很久才给一帧，
+            // 而"新客户端接入 → 重建会话 → 下发 offer"绝不能等帧
+            // （实测：屏静止时回调几分钟不触发，客户端会一直卡在"等待 offer"）。
+            // 另一个好处：广播变慢也不会拖住采集主循环。
+            {
+                let rtc = rtc.clone();
+                let hub_pump = hub.clone();
+                std::thread::spawn(move || {
+                    use remote_screen_host_win::webrtc::SignalOut;
+                    let mut last_gen = hub_pump.peer_generation();
+                    let mut last_restart = std::time::Instant::now()
+                        - std::time::Duration::from_secs(10);
+                    loop {
+                        // 1) 新客户端接入 → 重建会话（一个 pc 只能协商一次）
+                        let gen = hub_pump.peer_generation();
+                        if gen != last_gen {
+                            last_gen = gen;
+                            // 防抖：restart 后 500ms 内忽略新的接入，
+                            // 避免"重建动作本身触发 generation 变化 → 再 restart"的死循环。
+                            let now = std::time::Instant::now();
+                            if now.duration_since(last_restart)
+                                > std::time::Duration::from_millis(500)
+                            {
+                                last_restart = now;
+                                println!("[webrtc] 检测到第 {gen} 次客户端接入，重建会话");
+                                if let Ok(h) = rtc.lock() {
+                                    h.restart();
+                                }
+                            }
+                        }
+                        // 2) 会话 → 浏览器：offer / candidate（先在锁内取出，再在锁外广播）
+                        let sigs: Vec<SignalOut> = {
+                            let h = match rtc.lock() {
+                                Ok(h) => h,
+                                Err(_) => break,
+                            };
+                            let mut v = Vec::new();
+                            while let Some(s) = h.poll_signal() {
+                                v.push(s);
+                            }
+                            v
+                        };
+                        for sig in sigs {
+                            match sig {
+                                SignalOut::Offer { sdp } => {
+                                    let (ok, dead) = hub_pump.broadcast_text(&format!(
+                                        "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
+                                        json_escape(&sdp)
+                                    ));
+                                    println!("[webrtc] offer 已发送：成功 {ok} 个，断开 {dead} 个");
+                                }
+                                SignalOut::Candidate {
+                                    candidate,
+                                    sdp_mid,
+                                    sdp_mline_index,
+                                } => {
+                                    hub_pump.broadcast_text(&format!(
+                                        "{{\"t\":\"webrtc-cand\",\"candidate\":\"{}\",\"sdpMid\":\"{}\",\"sdpMLineIndex\":{}}}",
+                                        json_escape(&candidate),
+                                        sdp_mid.clone().unwrap_or_default(),
+                                        sdp_mline_index.unwrap_or(0)
+                                    ));
+                                }
+                                SignalOut::State(s) => println!("[webrtc] {s}"),
+                            }
+                        }
+                        // 3) 浏览器 → 会话：answer / candidate
+                        for text in hub_pump.poll_inbox() {
+                            if let Some(sig) = parse_signal_json(&text) {
+                                if let Ok(h) = rtc.lock() {
+                                    h.deliver(sig);
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                });
+            }
+
             let mut enc2 = enc;
             let mut au_count: u64 = 0;
             let mut dropped: u64 = 0;
@@ -529,44 +666,18 @@ fn main() {
                     let chunks = enc2.read_chunks()?;
                     for c in chunks {
                         // WebRTC 模式送原始 AU（不带标记位），packetization 交给 H264Payloader
-                        rtc.push_frame(&c.data);
+                        if let Ok(h) = rtc.lock() {
+                            h.push_frame(&c.data);
+                        }
                         au_count += 1;
-                    }
-                    // 信令上报：offer / candidate
-                    while let Some(sig) = rtc.poll_signal() {
-                        use remote_screen_host_win::webrtc::SignalOut;
-                        match sig {
-                            SignalOut::Offer { sdp } => {
-                                let (ok, _dead) = hub2.broadcast_text(&format!(
-                                    "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
-                                    json_escape(&sdp)
-                                ));
-                                if ok > 0 {
-                                    println!("[webrtc] offer 已发送给 {ok} 个客户端");
-                                }
-                            }
-                            SignalOut::Candidate { candidate, sdp_mid, sdp_mline_index } => {
-                                hub2.broadcast_text(&format!(
-                                    "{{\"t\":\"webrtc-cand\",\"candidate\":\"{}\",\"sdpMid\":\"{}\",\"sdpMLineIndex\":{}}}",
-                                    json_escape(&candidate),
-                                    sdp_mid.clone().unwrap_or_default(),
-                                    sdp_mline_index.unwrap_or(0)
-                                ));
-                            }
-                            SignalOut::State(s) => println!("[webrtc] {s}"),
-                        }
-                    }
-                    // 信令回传：answer / candidate
-                    for text in hub2.poll_inbox() {
-                        if let Some(sig) = parse_signal_json(&text) {
-                            rtc.deliver(sig);
-                        }
                     }
                     Ok(())
                 },
             );
 
-            rtc.close();
+            if let Ok(h) = rtc.lock() {
+                h.close();
+            }
             match res {
                 Ok(stats) => {
                     println!(
@@ -594,14 +705,19 @@ fn main() {
             let seconds = arg_value(&args, "--seconds")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(5);
-            let target = match displays.get(index) {
-                Some(d) => d,
+            let want = arg_value(&args, "--display");
+            let (index, target) = match pick_display(&displays, index, want.as_deref()) {
+                Some(v) => v,
                 None => {
-                    eprintln!("显示目标 #{index} 不存在（共 {} 个）", displays.len());
+                    eprintln!(
+                        "未找到匹配的显示目标（--display {:?}，共 {} 个）",
+                        want,
+                        displays.len()
+                    );
                     std::process::exit(2);
                 }
             };
-            println!("目标: {}", target.label());
+            println!("目标: [{index}] {}", target.label());
             println!(
                 "  位置=({},{}) 模式={}x{}@{}Hz 虚拟={}",
                 target.bounds.x,
@@ -655,7 +771,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe | capture-dump | stream [--index N] [--port P] [--seconds S] [--nv12 file] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--display SUBSTR] | capture-diag [--display SUBSTR] [--seconds N] [--fps N] [--out FILE] | capture-dump | stream [--index N] [--display SUBSTR] [--port P] [--seconds S] [--fps N] [--bitrate K] [--nv12 file] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
         }
     }
 }
@@ -664,6 +780,29 @@ fn main() {
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     let pos = args.iter().position(|a| a == key)?;
     args.get(pos + 1).cloned()
+}
+
+/// 按**稳定身份**选屏，不要只靠下标：显示器枚举顺序会随插拔/驱动重载漂移
+/// （实测同一块 MttVDD 虚拟屏的 index 从 5 漂到 43，用户按旧下标跑会采到 0x0 的空设备）。
+///
+/// `--display <子串>` 匹配 label / 设备路径 / 适配器 ID，例如
+/// `--display MttVDD`、`--display DISPLAY76`、`--display ToDeskIdd`。
+fn pick_display<'a>(
+    displays: &'a [remote_screen_core::DisplayInfo],
+    index: usize,
+    want: Option<&str>,
+) -> Option<(usize, &'a remote_screen_core::DisplayInfo)> {
+    match want {
+        Some(sub) if !sub.trim().is_empty() => {
+            let s = sub.trim().to_ascii_lowercase();
+            displays.iter().enumerate().find(|(_, d)| {
+                let hay = format!("{} {} {}", d.label(), d.device_path, d.adapter_device_id)
+                    .to_ascii_lowercase();
+                hay.contains(&s)
+            })
+        }
+        _ => displays.get(index).map(|d| (index, d)),
+    }
 }
 
 /// 定位 ffmpeg 可执行文件：环境变量 → tools/ffmpeg/bin → PATH → WinGet 链接目录。

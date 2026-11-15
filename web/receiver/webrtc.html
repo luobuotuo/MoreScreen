@@ -31,6 +31,8 @@
   <span class="stat">帧率 <b id="fps">—</b></span>
   <span class="stat">码率 <b id="rate">—</b></span>
   <span class="stat">丢包 <b id="loss">—</b></span>
+  <span class="stat">帧 <b id="frames">—</b></span>
+  <span class="stat">重传 <b id="retx">—</b></span>
   <span class="stat">RTT <b id="rtt">—</b></span>
   <span class="stat">缓冲 <b id="jb">—</b></span>
 </header>
@@ -58,6 +60,9 @@ const WS_PORT = 8787;
 const video = el('v');
 let pc = null, ws = null, started = false;
 let tStart = 0, firstFrameLogged = false;
+// 宿主只协商一次；重复处理同一份 offer 会让浏览器再发一个 answer，
+// 宿主侧从 stable 状态应用第二个 answer 非法，会直接判会话失败。
+let lastOfferSdp = '';
 
 
 function send(obj) {
@@ -94,16 +99,40 @@ function buildPeerConnection() {
         L('★ 首帧上屏 +' + (performance.now() - tStart).toFixed(0) + ' ms');
       });
     }
+
+    // 真实上屏帧率：用 requestVideoFrameCallback 统计"真正渲染到屏幕"的帧，
+    // 与 getStats 的 framesDecoded/framesDropped 是两套独立口径。
+    // 若上屏帧率 ≈ 发送帧率，说明"丢帧"是统计假象；若确实低，才是真丢帧。
+    let rvfcCount = 0, rvfcStart = 0;
+    const countFrame = (now, meta) => {
+      rvfcCount++;
+      if (!rvfcStart) rvfcStart = now;
+      const sec = (now - rvfcStart) / 1000;
+      if (sec >= 1) {
+        const realFps = rvfcCount / sec;
+        L('【上屏】' + realFps.toFixed(1) + ' fps（' + rvfcCount + ' 帧 / ' + sec.toFixed(1) + 's）');
+        rvfcCount = 0; rvfcStart = now;
+      }
+      video.requestVideoFrameCallback(countFrame);
+    };
+    if (video.requestVideoFrameCallback) {
+      video.requestVideoFrameCallback(countFrame);
+    } else {
+      L('此内核不支持 requestVideoFrameCallback');
+    }
   };
 
   // 每秒采样一次：对外只给瞬时值（差分），累计值对判断卡顿没有意义
   let prev = null;
+  let rawLogged = 0;
   setInterval(async () => {
     if (!pc || pc.connectionState !== 'connected') return;
     let st;
     try { st = await pc.getStats(); } catch (e) { return; }
 
     let frames = 0, bytes = 0, lost = 0, recv = 0, jbDelay = 0, jbCount = 0;
+    let framesRecv = 0, framesDrop = 0, nack = 0, retx = 0;
+    let jbFlush = 0, jbTarget = 0;
     let rttMs = null, tw = 0, th = 0;
     st.forEach(r => {
       if (r.type === 'inbound-rtp' && r.kind === 'video') {
@@ -113,6 +142,12 @@ function buildPeerConnection() {
         recv    = r.packetsReceived || 0;
         jbDelay = r.jitterBufferDelay || 0;
         jbCount = r.jitterBufferEmittedCount || 0;
+        framesRecv = r.framesReceived || 0;
+        framesDrop = r.framesDropped || 0;
+        nack = r.nackCount || 0;
+        retx = r.retransmittedPacketsReceived || 0;
+        jbFlush = r.jitterBufferFlushes || 0;
+        jbTarget = r.jitterBufferTargetDelay || 0;
       }
       if (r.type === 'track' && r.kind === 'video') { tw = r.frameWidth || 0; th = r.frameHeight || 0; }
       if (r.type === 'candidate-pair' && r.state === 'succeeded'
@@ -136,19 +171,57 @@ function buildPeerConnection() {
     if (rttMs !== null) el('rtt').textContent = rttMs.toFixed(1) + ' ms';
     // jitterBufferDelay 是解码前缓冲时长，端到端延迟的主要可见组成
     if (jbCount > 0) el('jb').textContent = (jbDelay * 1000 / jbCount).toFixed(0) + ' ms';
+    // 缓冲清空次数：>0 说明浏览器在主动丢缓冲里的帧（累积延迟超限），
+    // 这是「丢包 0 但丢帧持续涨」最可能的直接来源
+    if (jbFlush > 0) L('⚠ jitterBuffer 已清空 ' + jbFlush + ' 次（目标 ' + jbTarget + 'ms）', 'warn');
+    // 解码帧数 / 收到帧数（差值就是被丢的）；重传：收到的重传包 / 发出的 NACK 请求
+    if (framesRecv > 0) {
+      el('frames').textContent = frames + '/' + framesRecv
+        + (framesDrop > 0 ? ' 丢' + framesDrop : '');
+    }
+    if (nack > 0 || retx > 0) {
+      const r = el('retx');
+      r.textContent = retx + '/' + nack;
+      // NACK 发了却收不到重传 = 宿主没在重传（拦截器未注册时的典型症状）
+      r.style.color = (nack > 0 && retx === 0) ? '#f28b82'
+                    : (retx < nack ? '#fdd663' : '#81c995');
+    }
 
     const now = performance.now();
     if (prev && now > prev.t) {
       const dt = (now - prev.t) / 1000;
       const fpsNow = (frames - prev.frames) / dt;
       const kbps = (bytes - prev.bytes) * 8 / 1000 / dt;
-      el('fps').textContent = fpsNow > 0 ? fpsNow.toFixed(1) + ' fps' : '0 fps';
-      el('rate').textContent = kbps >= 1000
-        ? (kbps / 1000).toFixed(2) + ' Mbps'
-        : Math.max(0, kbps).toFixed(0) + ' kbps';
-      el('bar').style.width = Math.max(0, Math.min(100, kbps / 80)) + '%';   // 8 Mbps 满格
+      // 页面切到后台时浏览器会暂停 video 解码，framesDecoded 不再增长。
+      // 这时显示 0 fps 会被误读成链路故障，直接标注出来。
+      const bg = document.hidden;
+      el('fps').textContent = bg
+        ? '后台挂起'
+        : (fpsNow > 0 ? fpsNow.toFixed(1) + ' fps' : '0 fps');
+      el('rate').textContent = bg
+        ? '后台挂起'
+        : (kbps >= 1000
+            ? (kbps / 1000).toFixed(2) + ' Mbps'
+            : Math.max(0, kbps).toFixed(0) + ' kbps');
+      el('bar').style.width = Math.max(0, Math.min(100, kbps / 8)) + '%';   // 800 kbps 满格
     }
     prev = { t: now, frames, bytes };
+
+    // 每 5 秒打印一次 inbound-rtp 的原始诊断，定位「丢包 0 但丢帧涨」的机制
+    if (framesRecv > 0 && (!rawLogged || now - rawLogged > 5000)) {
+      rawLogged = now;
+      L('【raw】framesDecoded=' + frames
+        + ' framesReceived=' + framesRecv
+        + ' framesDropped=' + framesDrop
+        + ' packetsLost=' + lost
+        + ' packetsReceived=' + recv
+        + ' jitterBufferFlushes=' + jbFlush
+        + ' jitterBufferEmitted=' + jbCount
+        + ' jitterBufferDelay(s)=' + jbDelay.toFixed(2)
+        + ' nackCount=' + nack
+        + ' retxPkts=' + retx
+        + ' 目标=' + jbTarget);
+    }
   }, 1000);
 }
 
@@ -164,6 +237,8 @@ function connectSignaling() {
     catch (e) { return; }   // 二进制视频数据忽略
 
     if (msg.t === 'webrtc-offer') {
+      if (msg.sdp === lastOfferSdp) { L('忽略重复 offer（同一份 SDP）'); return; }
+      lastOfferSdp = msg.sdp;
       if (!pc) buildPeerConnection();
       L('收到 offer，生成 answer…');
       try {

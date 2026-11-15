@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,9 +21,12 @@ pub struct Hub {
     last_keyframe: Arc<Mutex<Option<Vec<u8>>>>,
     /// 客户端发来的文本消息（信令回传：answer / ICE candidate）。
     inbox: Arc<Mutex<Vec<String>>>,
-    /// 最近一条信令（offer）：新客户端接入时立即补发，
-    /// 否则客户端连晚了就永久收不到 offer（与 last_keyframe 同一机制）。
-    last_signal: Arc<Mutex<Option<String>>>,
+    /// 客户端代数：每次有新客户端登记就 +1，主线程据此重建 WebRTC 会话。
+    ///
+    /// 这是**替代 offer 缓存**的机制。旧设计把 offer 存起来给新客户端补发，
+    /// 但 PeerConnection 只能协商一次，旧 offer 交给新客户端只会卡在 ICE checking；
+    /// 正确做法是新客户端接入 → 重建 pc → 重新生成 offer。
+    peer_gen: Arc<AtomicU64>,
 }
 
 impl Hub {
@@ -31,14 +35,15 @@ impl Hub {
             clients: Arc::new(Mutex::new(Vec::new())),
             last_keyframe: Arc::new(Mutex::new(None)),
             inbox: Arc::new(Mutex::new(Vec::new())),
-            last_signal: Arc::new(Mutex::new(None)),
+            peer_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// 登记新客户端，并立即补发最近的关键帧与最近的信令。
+    /// 登记新客户端：补发最近关键帧，并把客户端代数 +1（触发会话重建）。
     ///
-    /// 补发信令很关键：offer 只在会话建立时产生一次，
-    /// 若客户端在那之后才连上，不补发就永远收不到 offer。
+    /// 不再补发旧的 offer：一个 PeerConnection 只能协商一次，
+    /// 把旧 offer 交给新客户端只会让它卡在 ICE checking（实测复现）。
+    /// 新 offer 由主线程检测到代数变化后重建会话时重新生成。
     fn add(&self, client: Client) {
         {
             let kf = self.last_keyframe.lock().unwrap().clone();
@@ -48,15 +53,13 @@ impl Hub {
                 }
             }
         }
-        {
-            let sig = self.last_signal.lock().unwrap().clone();
-            if let Some(text) = sig {
-                if let Ok(mut ws) = client.lock() {
-                    let _ = ws.send(Message::Text(text));
-                }
-            }
-        }
         self.clients.lock().unwrap().push(client);
+        self.peer_gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 当前客户端代数。主线程每次轮询都比较，变化即重建会话。
+    pub fn peer_generation(&self) -> u64 {
+        self.peer_gen.load(Ordering::SeqCst)
     }
 
     /// 记录一条客户端发来的文本消息（信令）。
@@ -69,9 +72,11 @@ impl Hub {
         std::mem::take(&mut *self.inbox.lock().unwrap())
     }
 
-    /// 广播一段文本（JSON 信令）并缓存，返回 (成功数, 断开数)。
+    /// 广播一段文本（JSON 信令），不写缓存。返回 (成功数, 断开数)。
+    ///
+    /// offer 与 candidate 都走这里：补发不靠缓存，靠"客户端代数 → 重建会话"
+    /// （见 `peer_gen`）。这样不存在把过期 offer 塞给新客户端的问题。
     pub fn broadcast_text(&self, text: &str) -> (usize, usize) {
-        *self.last_signal.lock().unwrap() = Some(text.to_string());
         self.broadcast_raw(Message::Text(text.to_string()))
     }
 
@@ -133,6 +138,12 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
             let hub = hub2.clone();
             std::thread::spawn(move || {
                 if let Ok(ws) = accept(stream) {
+                    // 读必须带超时。此前 read() 在**持锁**状态下无限阻塞，
+                    // 而广播要拿同一把锁 → 广播线程被永久卡死。
+                    // 症状：采集回调停住、帧数不再增长、offer 发不出去、客户端一直等 offer。
+                    let _ = ws
+                        .get_ref()
+                        .set_read_timeout(Some(Duration::from_millis(20)));
                     let client: Client = Arc::new(Mutex::new(ws));
                     hub.add(client.clone());
                     // 持续读取客户端消息（信令回传：answer / ICE candidate）
@@ -144,6 +155,13 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
                             };
                             match guard.read() {
                                 Ok(m) => m,
+                                Err(tungstenite::Error::Io(ref e))
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                                {
+                                    // 没有新消息：释放锁让广播有机会拿锁发送
+                                    continue;
+                                }
                                 Err(_) => break, // 连接断开
                             }
                         };
