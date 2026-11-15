@@ -297,3 +297,37 @@ setupapi.dev.log 给出明确原因：
 ### 待验证（需真机）
 
 浏览器端出画面：手机打开 `http://<主机IP>:8788/webrtc.html` → 点「开始接收」→ 应看到实时桌面。
+
+## 八、P1.2 WebRTC 最小闭环：本机全通，待真机验证（11-15）
+
+### 已完成
+
+| 组件 | 文件 | 说明 |
+|---|---|---|
+| 会话管理 | `crates/host-win/src/webrtc.rs` | 线程桥接（同步采集 → `sync_channel(2)` → tokio `current_thread` 运行时 → `write_sample`）；有界通道背压丢帧；RTP 时间戳 90kHz |
+| API 构建 | `webrtc::build_api()` | **只注册一种 H.264**（42e01f + packetization-mode=1）+ 禁用 mDNS |
+| 信令 | `serve.rs` Hub | 新增 `broadcast_text` / `poll_inbox` / **信令缓存与新客户端补发**；JSON 手工编解码（`json_escape` 复用 core） |
+| 接收端 | `web/receiver/webrtc.html` | `RTCPeerConnection` + `<video srcObject>`；`playsinline`/`muted`；连接状态与 `getStats()` 展示；需用户点「开始接收」 |
+| CLI | `rs-host stream-webrtc` | 全链路串联；`--fps` 可调 |
+| 启动器 | `scripts/run_stream.cmd --webrtc` | 一键启动 |
+
+### 三个关键实测结论（都是踩出来的）
+
+1. **必须 `create_data_channel` + 等 `gathering_complete_promise`**：否则后台 ICE gathering 不被触发，
+   `local_description` 不含候选，ICE 永远停在 Connecting。标准做法是把**含候选的 SDP** 直接传给对端，
+   不依赖 trickle 转发。（依据 webrtc-rs 官方 `signal_pair` 流程）
+2. **必须禁用 mDNS**：默认模式产生 `.local` 候选，局域网对端无法解析。
+   `SettingEngine::set_ice_multicast_dns_mode(MulticastDnsMode::Disabled)`。
+3. **必须只注册一种 H.264 codec**：`register_default_codecs()` 会注册 6 种 H264 变体，
+   浏览器可能协商到 `42001f`（非 constrained）而编码器输出是 `42e01f`，profile 不匹配会花屏/拒收。
+
+### 本机验证结果
+
+- **回环验证**（`examples/webrtc_loopback.rs`，双 PeerConnection）：
+  ICE Connected → `on_track` 收到视频 → **1830 个 RTP 包 / 2,129,220 字节**，H264Packet 可正确解析；
+- **信令验证**（`scripts/signal_probe.py`）：offer 正常生成并广播（1151 字节，单一 H264 m-line + host candidate）；
+  延迟连接也能收到补发的 offer。
+
+### 待验证（需真机）
+
+浏览器端出画面：手机打开 `http://<主机IP>:8788/webrtc.html` → 点「开始接收」→ 应看到实时桌面。
