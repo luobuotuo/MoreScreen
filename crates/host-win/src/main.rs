@@ -184,7 +184,7 @@ fn main() {
                     std::process::exit(5);
                 }
             };
-            let page = "web/receiver/index.html";
+            let page = "web/receiver";
             let http_bound = remote_screen_host_win::serve::start_http(http_port, page)
                 .map(|p| p)
                 .unwrap_or(http_port);

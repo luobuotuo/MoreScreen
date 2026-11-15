@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>接收端能力诊断</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101114; color: #e8eaed; font: 14px/1.7 system-ui, "Microsoft YaHei", sans-serif; padding: 14px; }
+  h1 { font-size: 17px; margin: 0 0 4px; }
+  .sub { color: #9aa0a6; font-size: 12px; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 14px; }
+  td, th { padding: 7px 8px; border-bottom: 1px solid #26282e; text-align: left; vertical-align: top; }
+  th { color: #9aa0a6; font-weight: 500; font-size: 12px; }
+  .ok { color: #81c995; font-weight: 600; }
+  .bad { color: #f28b82; font-weight: 600; }
+  .warn { color: #fdd663; font-weight: 600; }
+  video { width: 100%; max-width: 480px; background: #000; border-radius: 8px; display: block; margin: 8px 0; }
+  .verdict { padding: 12px 14px; border-radius: 10px; background: #1c1f26; border-left: 4px solid #8ab4f8; margin-top: 10px; }
+  code { background: #26282e; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  #log { color: #9aa0a6; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>接收端能力诊断</h1>
+<div class="sub">这一页只做检测，不推流。用于决定接收端走浏览器还是原生 App。</div>
+
+<table id="tbl">
+  <tr><th style="width:32%">检测项</th><th>结果</th></tr>
+</table>
+
+<div id="videoBox" style="display:none">
+  <b>&lt;video&gt; 实际播放测试（H.264 / AAC / MP4）</b>
+  <video id="v" controls playsinline preload="auto" src="probe.mp4"></video>
+  <div id="vlog" class="sub">加载中…</div>
+</div>
+
+<div class="verdict" id="verdict">检测中…</div>
+<div id="log"></div>
+
+<script>
+const tbl = document.getElementById('tbl');
+const logEl = document.getElementById('log');
+function row(name, value, cls) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = '<td>' + name + '</td><td class="' + (cls || '') + '">' + value + '</td>';
+  tbl.appendChild(tr);
+  return tr;
+}
+const lines = [];
+function L(s) { lines.push(s); logEl.textContent = lines.join('\n'); }
+
+(async () => {
+  // ---------- 0. 环境 ----------
+  row('浏览器 UA', navigator.userAgent);
+  row('屏幕', screen.width + 'x' + screen.height + ' @DPR' + window.devicePixelRatio);
+  row('WebRTC 可用', typeof RTCPeerConnection === 'function' ? '是' : '否',
+      typeof RTCPeerConnection === 'function' ? 'ok' : 'bad');
+  row('MediaSource(MSE)', typeof MediaSource !== 'undefined' ? '是' : '否',
+      typeof MediaSource !== 'undefined' ? 'ok' : 'bad');
+  row('WebCodecs', typeof VideoDecoder === 'function' ? '是' : '否',
+      typeof VideoDecoder === 'function' ? 'ok' : 'warn');
+
+  // ---------- 1. <video> 静态能力（最关键的路线） ----------
+  const v = document.createElement('video');
+  const canH264 = v.canPlayType && v.canPlayType('video/mp4; codecs="avc1.42E01E"');
+  const canH264b = v.canPlayType && v.canPlayType('video/mp4; codecs="avc1.640028"');
+  const canAac = v.canPlayType && v.canPlayType('audio/mp4; codecs="mp4a.40.2"');
+  const map = { 'probably': 'ok', 'maybe': 'warn', '': 'bad' };
+  row('&lt;video&gt; 能放 H.264 Baseline', '"' + (canH264 || '') + '"', map[canH264 || '']);
+  row('&lt;video&gt; 能放 H.264 High', '"' + (canH264b || '') + '"', map[canH264b || '']);
+  row('&lt;video&gt; 能放 AAC', '"' + (canAac || '') + '"', map[canAac || '']);
+
+  // ---------- 2. MSE 能否吃 H.264 MP4 ----------
+  if (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported) {
+    const mseH264 = MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+    row('MSE 支持 H.264 mp4', String(mseH264), mseH264 ? 'ok' : 'bad');
+  }
+
+  // ---------- 3. WebCodecs H.264（已知失败，留档对照） ----------
+  if (typeof VideoDecoder === 'function') {
+    for (const c of ['avc1.42E01F', 'avc1.640028']) {
+      let r = 'n/a';
+      try {
+        const s = await VideoDecoder.isConfigSupported({ codec: c, codedWidth: 1920, codedHeight: 1080, avc: { format: 'annexb' } });
+        r = String(s.supported);
+      } catch (e) { r = 'err:' + e.name; }
+      row('WebCodecs ' + c, r, r === 'true' ? 'ok' : 'bad');
+    }
+  }
+
+  // ---------- 4. WebRTC 能否收发 H.264（决定 libwebrtc 路线） ----------
+  if (typeof RTCPeerConnection === 'function') {
+    try {
+      const caps = RTCRtpSender.getCapabilities('video');
+      const h264 = (caps && caps.codecs || []).filter(c => /H264|h264/i.test(c.mimeType));
+      h264.forEach(c => row('WebRTC 可编码 ' + c.mimeType,
+        (c.sdpFmtpLine || '') + ' clock=' + c.clockRate, 'ok'));
+      if (h264.length === 0) row('WebRTC H.264 编码', '无（设备不支持）', 'bad');
+      const dec = (RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video') || {}).codecs || [];
+      const dh264 = dec.filter(c => /H264|h264/i.test(c.mimeType));
+      row('WebRTC H.264 解码', dh264.length > 0 ? dh264.map(c => c.mimeType).join(', ') : '无', dh264.length ? 'ok' : 'bad');
+    } catch (e) { row('WebRTC 能力查询', '失败: ' + e, 'bad'); }
+  }
+
+  // ---------- 5. 实际播放测试 ----------
+  const box = document.getElementById('videoBox');
+  const vlog = document.getElementById('vlog');
+  const vid = document.getElementById('v');
+  box.style.display = 'block';
+  let played = false, errored = '';
+  vid.addEventListener('playing', () => { played = true; vlog.textContent = '正在播放 ✓'; vlog.className = 'sub ok'; });
+  vid.addEventListener('error', () => {
+    const e = vid.error;
+    errored = e ? (e.code + ' ' + e.message) : 'unknown';
+    vlog.textContent = '播放失败: ' + errored;
+    vlog.className = 'sub bad';
+    row('&lt;video&gt; 实际播放 mp4', '失败: ' + errored, 'bad');
+    verdict();
+  });
+  vid.addEventListener('timeupdate', () => {
+    if (vid.currentTime > 0.5 && !played) { played = true; row('&lt;video&gt; 实际播放 mp4', '成功（已播到 ' + vid.currentTime.toFixed(1) + 's）', 'ok'); verdict(); }
+  });
+  setTimeout(() => {
+    if (!played && !errored) { row('&lt;video&gt; 实际播放 mp4', '超时未播放', 'bad'); verdict(); }
+  }, 15000);
+  try { await vid.play(); } catch (e) { L('autoplay 被拒（需手动点播放，不影响结论）: ' + e.message); }
+
+  // ---------- 总结论 ----------
+  function verdict() {
+    const el = document.getElementById('verdict');
+    const okPlay = played;
+    const h264play = (canH264 || '').length > 0;
+    if (okPlay) {
+      el.innerHTML = '<b class="ok">结论：浏览器路线可行。</b><br>' +
+        '这台设备的 <code>&lt;video&gt;</code> 能正常播放 H.264。当前收端用 WebCodecs 是选错入口，' +
+        '应改为 <b>WebRTC + &lt;video&gt; srcObject</b>（Deskreen 走的就是这条），或先用 MSE 过渡。<br>' +
+        '下一步：把传输层换成 libwebrtc。';
+    } else if (h264play) {
+      el.innerHTML = '<b class="warn">结论：浏览器声称能放 H.264，但实际播放失败。</b><br>' +
+        'canPlayType 返回 "' + (canH264 || '') + '"，但视频加载/播放报错。可能是编解码细节（profile/level）或文件问题，' +
+        '需要进一步定位。请把上面的 UA 与实际播放报错发回。';
+    } else {
+      el.innerHTML = '<b class="bad">结论：浏览器路线不可行，应做原生 Android。</b><br>' +
+        '这台设备的浏览器完全不支持 H.264 播放（canPlayType 为空、实际播放失败）。' +
+        '继续在浏览器侧投入无法收效，应改用 <b>Kotlin + MediaCodec</b> 做原生接收端。';
+    }
+  }
+})();
+</script>
+</body>
+</html>

@@ -101,40 +101,88 @@ pub fn start_ws(port: u16) -> std::io::Result<(Hub, u16)> {
     Ok((hub, bound))
 }
 
-/// 启动极简静态文件服务（用于托管接收端页面）。
-pub fn start_http(port: u16, file_path: &str) -> std::io::Result<u16> {
+/// 启动极简静态文件服务（托管接收端目录）。
+///
+/// - 根路径返回 `index.html`，其余按 URL 路径映射到 `root_dir` 下的文件；
+/// - **安全**：拒绝含 `..`、`\`、`:` 或以 `/` 开头的请求，防止目录穿越；
+/// - `Content-Type` 按扩展名推断（PWA 需要 js/css/webmanifest 等多种类型）。
+pub fn start_http(port: u16, root_dir: &str) -> std::io::Result<u16> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     let bound = listener.local_addr()?.port();
-    let path = file_path.to_string();
+    let root = std::path::PathBuf::from(root_dir);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = match stream {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let path = path.clone();
+            let root = root.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 let first_line = req.lines().next().unwrap_or("");
-                let body = std::fs::read(&path).unwrap_or_default();
-                if first_line.starts_with("GET") {
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = stream.write_all(header.as_bytes());
-                    let _ = stream.write_all(&body);
-                } else {
+
+                if !first_line.starts_with("GET") {
                     let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.flush();
+                    return;
                 }
+
+                // 解析请求路径（去掉查询串）
+                let raw = first_line.split_whitespace().nth(1).unwrap_or("/");
+                let rel = raw.split('?').next().unwrap_or("/").trim_start_matches('/');
+
+                // 目录穿越防护
+                let unsafe_req = rel.contains("..") || rel.contains('\\') || rel.contains(':');
+                let rel = if rel.is_empty() { "index.html" } else { rel };
+
+                let (status, ctype, body) = if unsafe_req {
+                    ("403 Forbidden", "text/plain; charset=utf-8", b"forbidden".to_vec())
+                } else {
+                    let target = root.join(rel);
+                    match std::fs::read(&target) {
+                        Ok(b) if target.is_file() => ("200 OK", content_type(rel), b),
+                        _ => (
+                            "404 Not Found",
+                            "text/plain; charset=utf-8",
+                            format!("not found: {}", rel).into_bytes(),
+                        ),
+                    }
+                };
+
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
                 let _ = stream.flush();
             });
         }
     });
     Ok(bound)
+}
+
+/// 按扩展名推断 Content-Type。
+fn content_type(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "ico" => "image/x-icon",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
 }
 
 /// 取本机第一个非回环 IPv4 地址（用于打印访问地址）。
