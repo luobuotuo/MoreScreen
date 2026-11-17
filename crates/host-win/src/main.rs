@@ -501,6 +501,8 @@ fn main() {
             println!("ffmpeg      : {}", ffmpeg);
             println!("WS 信令     : ws://{ip}:{ws_bound}");
             println!("接收端页面  : http://{ip}:{http_bound}/webrtc.html");
+            // 配对页：展示二维码，平板扫一下即可，免手输 IP（P2.4）
+            println!("扫码配对页  : http://{ip}:{http_bound}/pair.html   ← 在平板上打开此页扫二维码");
             println!("等待接收端连接…（页面需点「开始接收」）");
 
             let displays = enumerate_displays();
@@ -617,6 +619,23 @@ fn main() {
                 remote_screen_host_win::webrtc::WebRtcHub::new(fps),
             );
 
+            // ---- 输入回传（P2.5 / P2.6）：默认关闭，必须显式 --allow-input ----
+            if args.iter().any(|a| a == "--allow-input") {
+                remote_screen_host_win::input::enable();
+                remote_screen_host_win::input::set_target_rect(
+                    target.bounds.x,
+                    target.bounds.y,
+                    target.bounds.width.max(1),
+                    target.bounds.height.max(1),
+                );
+                println!(
+                    "输入回传    : 已启用（接收端可控制本机；目标区域 {},{} {}x{}）",
+                    target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height
+                );
+            } else {
+                println!("输入回传    : 关闭（默认；如需控制请加 --allow-input）");
+            }
+
             // ---- 信令泵：独立线程 ----
             // 不能挂在采集回调上：虚拟屏静止时 WGC 可能很久才给一帧，
             // 而"新客户端接入 → 建会话 → 下发 offer"绝不能等帧
@@ -676,6 +695,7 @@ fn main() {
                                     );
                                 }
                                 SignalOut::State(s) => println!("[webrtc] #{id} {s}"),
+                                SignalOut::Ctl(text) => handle_ctl(id, &text),
                             }
                         }
                         // 4) 浏览器 → 会话：answer / candidate，定向投递给所属会话
@@ -810,7 +830,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--display SUBSTR] | capture-diag [--display SUBSTR] [--seconds N] [--fps N] [--out FILE] | capture-dump | stream [--index N] [--display SUBSTR] [--port P] [--seconds S] [--fps N] [--bitrate K] [--nv12 file] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--display SUBSTR] | capture-diag [--display SUBSTR] [--seconds N] [--fps N] [--out FILE] | capture-dump | stream [--index N] [--display SUBSTR] [--port P] [--seconds S] [--fps N] [--bitrate K] [--nv12 file] | stream-webrtc [--display SUBSTR] [--mode WxH[@Hz]] [--fps N] [--bitrate K] [--seconds S] [--no-cursor] [--allow-input] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
         }
     }
 }
@@ -819,6 +839,157 @@ fn main() {
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     let pos = args.iter().position(|a| a == key)?;
     args.get(pos + 1).cloned()
+}
+
+// ---------- DataChannel 控制消息（P2.1 / P2.3v2 / P2.5 / P2.6）----------
+//
+// 客户端通过 DataChannel `ctl` 上报三类消息（JSON，字段极简，手写解析即可）：
+//   {"t":"device","w":CSS宽,"h":CSS高,"dpr":DPR,"portrait":bool}
+//   {"t":"stat","fps":上屏帧率,"loss":丢包百分比,"rtt":毫秒,"jb":缓冲毫秒}
+//   {"t":"input","k":"m","x":0~1,"y":0~1}          鼠标移动（归一化画面坐标）
+//   {"t":"input","k":"b","btn":"left","d":true}    按键按下/抬起
+//   {"t":"input","k":"w","d":120}                  滚轮（120 = 一格）
+//   {"t":"input","k":"key","vk":65,"d":true}       键盘（Windows 虚拟键码）
+
+/// 从扁平 JSON 文本里取数字字段（足够应付上面的固定结构，不引入 serde）。
+fn json_num(s: &str, key: &str) -> Option<f64> {
+    let pat = format!("\"{key}\":");
+    let i = s.find(&pat)? + pat.len();
+    let rest = s[i..].trim_start();
+    let end = rest
+        .find(|c: char| {
+            !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+        })
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
+/// 取字符串字段。
+fn json_str(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let i = s.find(&pat)? + pat.len();
+    let j = s[i..].find('"')? + i;
+    Some(s[i..j].to_string())
+}
+
+/// 取布尔字段。
+fn json_bool(s: &str, key: &str) -> Option<bool> {
+    let pat = format!("\"{key}\":");
+    let i = s.find(&pat)? + pat.len();
+    let rest = s[i..].trim_start();
+    if rest.starts_with("true") {
+        Some(true)
+    } else if rest.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// 按平板物理像素推荐虚拟屏模式（只给建议，是否应用由用户用 `--mode` 决定）。
+fn recommend_mode(phys_w: f64, phys_h: f64) -> Option<String> {
+    // 虚拟屏可用档位（实测评测枚举所得）
+    const CANDIDATES: &[(u32, u32)] = &[
+        (800, 600),
+        (1280, 720),
+        (1366, 768),
+        (1920, 1080),
+        (2560, 1440),
+        (3840, 2160),
+    ];
+    let portrait = phys_h > phys_w;
+    // 先按"面积最接近且不超过平板物理像素"挑选，其次取比例最接近的
+    let target_ratio = phys_w / phys_h;
+    let mut best: Option<(&(u32, u32), f64)> = None;
+    for c in CANDIDATES {
+        let (cw, ch) = if portrait { (c.1, c.0) } else { (c.0, c.1) };
+        let area = (cw as f64) * (ch as f64);
+        let ratio_err = ((cw as f64 / ch as f64) - target_ratio).abs();
+        let over = if area > phys_w * phys_h { 1000.0 } else { 0.0 };
+        let score = ratio_err * 1000.0 + over + (area / (phys_w * phys_h) - 1.0).abs() * 10.0;
+        if best.map(|(_, b)| score < b).unwrap_or(true) {
+            best = Some((c, score));
+        }
+    }
+    best.map(|(c, _)| {
+        let (cw, ch) = if portrait { (c.1, c.0) } else { (c.0, c.1) };
+        format!("{cw}x{ch}@60")
+    })
+}
+
+/// 处理一条 DataChannel 控制消息。
+fn handle_ctl(client_id: u64, text: &str) {
+    let t = json_str(text, "t").unwrap_or_default();
+    match t.as_str() {
+        "device" => {
+            let w = json_num(text, "w").unwrap_or(0.0);
+            let h = json_num(text, "h").unwrap_or(0.0);
+            let dpr = json_num(text, "dpr").unwrap_or(1.0);
+            let portrait = json_bool(text, "portrait").unwrap_or(false);
+            println!(
+                "[ctl] #{client_id} 设备：CSS {w:.0}x{h:.0} · DPR {dpr:.2} · {} · 物理 {:.0}x{:.0}",
+                if portrait { "竖屏" } else { "横屏" },
+                w * dpr,
+                h * dpr
+            );
+            if let Some(m) = recommend_mode(w * dpr, h * dpr) {
+                println!("[ctl] #{client_id} 建议虚拟屏模式：{m}（用 --mode {m} 应用）");
+            }
+        }
+        "stat" => {
+            let fps = json_num(text, "fps").unwrap_or(0.0);
+            let loss = json_num(text, "loss").unwrap_or(0.0);
+            let rtt = json_num(text, "rtt").unwrap_or(0.0);
+            let jb = json_num(text, "jb").unwrap_or(0.0);
+            // 画质建议：丢包是主要判据（>3% 已经影响观感）
+            let advice = if loss > 3.0 {
+                "建议降码率（丢包 >3%）"
+            } else if loss < 0.5 && fps > 25.0 {
+                "链路良好，可尝试提码率"
+            } else {
+                "维持当前码率"
+            };
+            println!(
+                "[ctl] #{client_id} 质量：上屏 {fps:.1}fps 丢包 {loss:.2}% RTT {rtt:.0}ms 缓冲 {jb:.0}ms → {advice}"
+            );
+        }
+        "input" => {
+            if !remote_screen_host_win::input::input_enabled() {
+                return; // 未开启输入回传：静默忽略
+            }
+            let k = json_str(text, "k").unwrap_or_default();
+            match k.as_str() {
+                "m" => {
+                    let x = json_num(text, "x").unwrap_or(0.0);
+                    let y = json_num(text, "y").unwrap_or(0.0);
+                    remote_screen_host_win::input::mouse_move(x, y);
+                }
+                "b" => {
+                    let btn = json_str(text, "btn").unwrap_or_default();
+                    let down = json_bool(text, "d").unwrap_or(false);
+                    remote_screen_host_win::input::mouse_button(&btn, down);
+                }
+                "w" => {
+                    let d = json_num(text, "d").unwrap_or(0.0) as i32;
+                    remote_screen_host_win::input::wheel(d);
+                }
+                "hw" => {
+                    let d = json_num(text, "d").unwrap_or(0.0) as i32;
+                    remote_screen_host_win::input::hwheel(d);
+                }
+                "key" => {
+                    let vk = json_num(text, "vk").unwrap_or(0.0) as u16;
+                    let down = json_bool(text, "d").unwrap_or(false);
+                    remote_screen_host_win::input::key(vk, down);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 解析 `--mode` 参数：`WxH@Hz` 或 `WxH`（省略刷新率则用 60Hz）。

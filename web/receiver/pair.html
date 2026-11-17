@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>remote-screen 配对</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; background: #101114; color: #e8eaed;
+         font: 14px/1.7 system-ui, "Microsoft YaHei", sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 24px; }
+  .card { width: 100%; max-width: 520px; background: #171a1f; border: 1px solid #26282e;
+          border-radius: 16px; padding: 28px; text-align: center; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 22px; }
+  #qrbox { display: inline-block; background: #fff; padding: 10px; border-radius: 12px; }
+  #qrbox canvas { display: block; image-rendering: pixelated; }
+  .url { margin: 22px 0 10px; padding: 14px; background: #0d0f12; border: 1px solid #2b2e35;
+         border-radius: 10px; font-family: ui-monospace, Consolas, monospace; font-size: 15px;
+         word-break: break-all; color: #8ab4f8; }
+  button { padding: 11px 18px; font-size: 14px; background: #1a73e8; color: #fff;
+           border: 0; border-radius: 10px; cursor: pointer; }
+  button.ghost { background: #26282e; color: #e8eaed; }
+  .tip { margin-top: 18px; color: #7b8087; font-size: 12px; line-height: 1.8; text-align: left; }
+  .warn { color: #fdd663; font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>扫描二维码连接</h1>
+  <div class="sub">用平板/手机的浏览器扫下方二维码即可打开接收端</div>
+
+  <div id="qrbox"><canvas id="qr"></canvas></div>
+  <div class="url" id="url">—</div>
+  <div>
+    <button id="copy">复制地址</button>
+    <button id="open" class="ghost">在本机打开</button>
+  </div>
+  <div class="warn" id="warn" style="display:none"></div>
+
+  <div class="tip">
+    · 首次使用请确认平板与本机在**同一个局域网**（同一 Wi-Fi）。<br>
+    · 二维码内容就是上面的地址，扫不出来时可直接手动输入。<br>
+    · 若本机 IP 变化（换网络、重连 Wi-Fi），刷新本页即可获得新地址。
+  </div>
+</div>
+
+<script src="qr.js"></script>
+<script>
+const target = location.protocol + '//' + location.hostname +
+               (location.port ? ':' + location.port : '') + '/webrtc.html';
+document.getElementById('url').textContent = target;
+
+const canvas = document.getElementById('qr');
+const warn = document.getElementById('warn');
+
+try {
+  const qr = window.QR && window.QR.encode(target);
+  if (qr) {
+    // 每模块 8px：29+8 静区 = 37 模块 → 296px，手机扫足够清晰
+    window.QR.drawTo(canvas, qr, 8);
+  } else {
+    canvas.style.display = 'none';
+    warn.style.display = 'block';
+    warn.textContent = '地址过长，无法生成二维码，请手动输入上方地址。';
+  }
+} catch (e) {
+  canvas.style.display = 'none';
+  warn.style.display = 'block';
+  warn.textContent = '二维码生成失败（' + e.message + '），请手动输入上方地址。';
+}
+
+document.getElementById('copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(target);
+    document.getElementById('copy').textContent = '已复制';
+    setTimeout(() => (document.getElementById('copy').textContent = '复制地址'), 1500);
+  } catch (e) {
+    // 非 https 下 clipboard API 可能不可用，退化为选中文本
+    const r = document.createRange();
+    r.selectNodeContents(document.getElementById('url'));
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+  }
+});
+
+document.getElementById('open').addEventListener('click', () => {
+  location.href = target;
+});
+</script>
+</body>
+</html>

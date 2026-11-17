@@ -38,6 +38,7 @@ use bytes::Bytes;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -190,6 +191,11 @@ pub enum SignalOut {
     },
     /// 连接状态变化（用于日志/UI）
     State(String),
+    /// DataChannel 收到的客户端消息（输入事件 / 设备信息 / 网络质量上报）。
+    ///
+    /// 走 DataChannel 而不是 WS：延迟更低、与媒体同一传输路径，
+    /// 且不需要在 WS 上再区分消息来源客户端。
+    Ctl(String),
 }
 
 /// 主线程 → 会话 的信令输入（浏览器回传的内容）。
@@ -206,6 +212,8 @@ pub enum SignalIn {
     /// 不再有 `Restart`：每个客户端一个独立 PeerConnection，
     /// 新客户端接入只需新建会话，不必打断任何已有会话。
     Shutdown,
+    /// 通过 DataChannel 向客户端下发一条文本（状态/配置/回执）。
+    Ctl(String),
 }
 
 /// 单个客户端会话的内部句柄。
@@ -454,9 +462,20 @@ async fn run_once(
     //  a) 必须先 create_data_channel，否则后台 ICE gathering 不会被触发；
     //  b) 必须等 gathering_complete_promise，local_description 才会包含候选。
     // 这样做的好处：浏览器收到含候选的 offer 即可直连，不依赖 trickle。
-    pc.create_data_channel("initial_data_channel", None)
+    // 数据通道 `ctl`：承载输入回传、设备信息与网络质量上报。
+    // 必须在这里创建（否则 ICE gathering 不会被触发，见下方注释）。
+    let ctl = pc
+        .create_data_channel("ctl", None)
         .await
         .map_err(|e| format!("create_data_channel 失败: {e}"))?;
+    {
+        let tx = signal_out_tx.clone();
+        ctl.on_message(Box::new(move |msg: DataChannelMessage| {
+            let text = String::from_utf8_lossy(&msg.data).to_string();
+            let _ = tx.send(SignalOut::Ctl(text));
+            Box::pin(async {}) as Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>
+        }));
+    }
     let offer = pc
         .create_offer(None)
         .await
@@ -571,6 +590,10 @@ async fn run_once(
                         SignalIn::Shutdown => {
                             let _ = pc.close().await;
                             return Ok(());
+                        }
+                        SignalIn::Ctl(text) => {
+                            // 宿主 → 客户端：状态/配置/回执（send_text 接受 Into<String>）
+                            let _ = ctl.send_text(text).await;
                         }
                     },
                     None => {

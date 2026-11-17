@@ -27,6 +27,14 @@
   #stage:fullscreen .tool,
   #stage:fullscreen .bar,
   #stage:fullscreen #log { display: none !important; }
+  /* 连接状态胶囊（P2.7 四态） */
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+          background: #26282e; color: #9aa0a6; border: 1px solid #33363d; }
+  .pill.ok { background: rgba(129,201,149,.14); color: #81c995; border-color: rgba(129,201,149,.35); }
+  .pill.warn { background: rgba(253,214,99,.13); color: #fdd663; border-color: rgba(253,214,99,.32); }
+  .pill.bad { background: rgba(242,139,130,.14); color: #f28b82; border-color: rgba(242,139,130,.35); }
+  /* 已开启控制时的按钮高亮，避免误以为还在控制 */
+  .tool.on { background: #1a73e8; color: #fff; }
   /* 全屏时浮一个极小的退出按钮（触摸即可，不干扰观感） */
   #exitfs { display: none; position: fixed; top: 8px; right: 8px; z-index: 9;
             padding: 6px 10px; font-size: 12px; background: rgba(0,0,0,.45); color: #cfd3d8;
@@ -39,7 +47,8 @@
 </head>
 <body>
 <header>
-  <h1>remote-screen 接收端 · WebRTC</h1>
+  <h1>remote-screen · WebRTC</h1>
+  <span id="state" class="pill">未连接</span>
   <span class="stat">信令 <b id="ws">未连接</b></span>
   <span class="stat">ICE <b id="ice">—</b></span>
   <span class="stat">连接 <b id="pc">—</b></span>
@@ -58,6 +67,7 @@
   <button id="start">点击开始接收</button>
   <button id="native" class="tool">1:1 原始尺寸</button>
   <button id="fs" class="tool">进入全屏</button>
+  <button id="ctlbtn" class="tool">控制本机</button>
   <button id="exitfs">退出全屏</button>
   <div class="bar"><i id="bar"></i></div>
   <div id="log"></div>
@@ -77,6 +87,47 @@ function L(s) {
 
 const WS_PORT = 8787;
 const video = el('v');
+
+// ---- P2 交互层全局状态 ----
+let dc = null;              // 控制 DataChannel（宿主创建，名 ctl）
+let inputOn = false;        // 输入回传开关（默认关，避免误操作主机）
+let lastMoveSent = 0;       // 鼠标移动节流时间戳（毫秒）
+// 供质量上报使用的最近一次统计值
+let lastFps = 0, lastLossPct = 0, lastRtt = 0, lastJb = 0;
+
+/// 通过控制通道发一条 JSON；通道未就绪时静默丢弃。
+function ctlSend(obj) {
+  if (dc && dc.readyState === 'open') {
+    try { dc.send(JSON.stringify(obj)); } catch (e) { /* 忽略瞬时错误 */ }
+  }
+}
+
+/// 上报本机显示信息（P2.3v2）：宿主据此推荐虚拟屏分辨率。
+function sendDeviceInfo() {
+  const w = window.innerWidth;
+  const h = window.innerHeight;
+  ctlSend({
+    t: 'device',
+    w: Math.round(w),
+    h: Math.round(h),
+    dpr: window.devicePixelRatio || 1,
+    portrait: h > w,
+  });
+  L('已上报设备：' + Math.round(w) + 'x' + Math.round(h) +
+    ' @' + (window.devicePixelRatio || 1).toFixed(2) + 'x' +
+    (h > w ? ' 竖屏' : ' 横屏'));
+}
+
+/// 把画面内的指针位置换算成 0~1 归一化坐标（左上原点）。
+/// 用 video 元素的渲染矩形，而非窗口，这样缩放/留白都正确。
+function normCoords(e) {
+  const r = video.getBoundingClientRect();
+  if (!r.width || !r.height) return null;
+  return {
+    x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+    y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+  };
+}
 let pc = null, ws = null, started = false;
 let tStart = 0, firstFrameLogged = false;
 // 宿主只协商一次；重复处理同一份 offer 会让浏览器再发一个 answer，
@@ -91,6 +142,22 @@ function send(obj) {
 function buildPeerConnection() {
   pc = new RTCPeerConnection({ iceServers: [] });   // 与宿主一致：只收 host candidate
 
+  // 宿主在 offer 之前建了 `ctl` 数据通道，这里接收它。
+  // 用途：输入回传（P2.5/P2.6）、设备信息上报（P2.3v2）、网络质量上报（P2.1）
+  pc.ondatachannel = (e) => {
+    if (e.channel.label !== 'ctl') return;
+    dc = e.channel;
+    dc.onopen = () => {
+      L('控制通道已就绪');
+      sendDeviceInfo();
+    };
+    dc.onclose = () => L('控制通道已关闭', 'warn');
+    dc.onmessage = (ev) => {
+      // 宿主下发的状态（例如输入是否已启用）
+      L('宿主：' + ev.data);
+    };
+  };
+
   pc.onicecandidate = (e) => {
     if (e.candidate) {
       send({ t: 'webrtc-cand', candidate: e.candidate.candidate,
@@ -102,10 +169,15 @@ function buildPeerConnection() {
   pc.oniceconnectionstatechange = () => { el('ice').textContent = pc.iceConnectionState; };
   pc.onconnectionstatechange = () => {
     el('pc').textContent = pc.connectionState;
-    if (pc.connectionState === 'connected') L('✅ WebRTC 已连接', 'ok');
-    if (pc.connectionState === 'failed') L('❌ 连接失败', 'bad');
-    if (pc.connectionState === 'disconnected') L('⚠️ 连接断开', 'warn');
+    if (pc.connectionState === 'connected') {
+      renderState('connected');
+      L('✅ WebRTC 已连接', 'ok');
+    }
+    if (pc.connectionState === 'connecting') renderState('connecting');
+    if (pc.connectionState === 'failed') { renderState('failed'); L('❌ 连接失败'); }
+    if (pc.connectionState === 'disconnected') { renderState('reconnecting'); L('⚠️ 连接断开，等待恢复'); }
   };
+  renderState('connecting');
   pc.ontrack = (e) => {
     L('收到远端视频轨');
     video.srcObject = e.streams[0];
@@ -183,13 +255,17 @@ function buildPeerConnection() {
     const totalPkts = lost + recv;
     if (totalPkts > 0) {
       const pct = lost * 100 / totalPkts;
+      lastLossPct = pct;
       const l = el('loss');
       l.textContent = lost + ' / ' + pct.toFixed(2) + '%';
       l.style.color = pct > 3 ? '#f28b82' : pct > 0.5 ? '#fdd663' : '#81c995';
     }
-    if (rttMs !== null) el('rtt').textContent = rttMs.toFixed(1) + ' ms';
+    if (rttMs !== null) { el('rtt').textContent = rttMs.toFixed(1) + ' ms'; lastRtt = rttMs; }
     // jitterBufferDelay 是解码前缓冲时长，端到端延迟的主要可见组成
-    if (jbCount > 0) el('jb').textContent = (jbDelay * 1000 / jbCount).toFixed(0) + ' ms';
+    if (jbCount > 0) {
+      lastJb = jbDelay * 1000 / jbCount;
+      el('jb').textContent = lastJb.toFixed(0) + ' ms';
+    }
     // 缓冲清空次数：>0 说明浏览器在主动丢缓冲里的帧（累积延迟超限），
     // 这是「丢包 0 但丢帧持续涨」最可能的直接来源
     if (jbFlush > 0) L('⚠ jitterBuffer 已清空 ' + jbFlush + ' 次（目标 ' + jbTarget + 'ms）', 'warn');
@@ -214,6 +290,7 @@ function buildPeerConnection() {
       // 页面切到后台时浏览器会暂停 video 解码，framesDecoded 不再增长。
       // 这时显示 0 fps 会被误读成链路故障，直接标注出来。
       const bg = document.hidden;
+      if (!bg) lastFps = fpsNow;
       el('fps').textContent = bg
         ? '后台挂起'
         : (fpsNow > 0 ? fpsNow.toFixed(1) + ' fps' : '0 fps');
@@ -352,6 +429,118 @@ el('native').addEventListener('click', () => {
   const on = video.classList.toggle('native');
   L('显示模式：' + (on ? '1:1 原始尺寸（不缩放）' : '自适应宽度（缩放显示）'));
 });
+// ---- P2.5 / P2.6 输入回传 ----
+// 默认关闭：点「控制本机」才开启，避免误触控制到主机。
+// 用 Pointer Events 统一处理鼠标与触摸（对两者都适用）。
+el('ctlbtn').addEventListener('click', () => {
+  inputOn = !inputOn;
+  el('ctlbtn').textContent = inputOn ? '停止控制' : '控制本机';
+  el('ctlbtn').classList.toggle('on', inputOn);
+  L(inputOn ? '输入回传已开启（触摸/鼠标将控制主机）' : '输入回传已关闭');
+  if (inputOn) {
+    sendDeviceInfo();
+    ctlSend({ t: 'hello-input' });
+  }
+});
+
+let dragging = false;
+let longPressTimer = null;
+const clearLongPress = () => {
+  if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+};
+
+video.addEventListener('pointerdown', (e) => {
+  if (!inputOn) return;
+  const p = normCoords(e);
+  if (!p) return;
+  e.preventDefault();
+  // 按下前先把光标移过去，否则点击会落在旧位置
+  ctlSend({ t: 'input', k: 'm', x: p.x, y: p.y });
+  ctlSend({ t: 'input', k: 'b', btn: 'left', d: true });
+  dragging = true;
+  try { video.setPointerCapture(e.pointerId); } catch (_) {}
+  // 长按 500ms 视为右键（移动端没有右键）
+  clearLongPress();
+  longPressTimer = setTimeout(() => {
+    longPressTimer = null;
+    if (!dragging) return;
+    dragging = false;
+    ctlSend({ t: 'input', k: 'b', btn: 'left', d: false });
+    ctlSend({ t: 'input', k: 'b', btn: 'right', d: true });
+    ctlSend({ t: 'input', k: 'b', btn: 'right', d: false });
+    L('已发送右键');
+  }, 500);
+});
+
+video.addEventListener('pointermove', (e) => {
+  if (!inputOn || !dragging) return;
+  clearLongPress();   // 一旦开始移动就不再算长按
+  // 节流到 ~60Hz：DataChannel 再多发也没意义，反而占带宽
+  const now = performance.now();
+  if (now - lastMoveSent < 16) return;
+  lastMoveSent = now;
+  const p = normCoords(e);
+  if (p) ctlSend({ t: 'input', k: 'm', x: p.x, y: p.y });
+});
+
+function endDrag(e) {
+  clearLongPress();
+  if (!inputOn || !dragging) return;
+  dragging = false;
+  ctlSend({ t: 'input', k: 'b', btn: 'left', d: false });
+  try { video.releasePointerCapture(e.pointerId); } catch (_) {}
+}
+video.addEventListener('pointerup', endDrag);
+video.addEventListener('pointercancel', endDrag);
+
+// 滚轮：一格 = 120
+video.addEventListener('wheel', (e) => {
+  if (!inputOn) return;
+  e.preventDefault();
+  ctlSend({ t: 'input', k: 'w', d: e.deltaY > 0 ? -120 : 120 });
+}, { passive: false });
+
+// 键盘：仅在输入回传开启时捕获，避免影响页面本身操作
+const KEYMAP = {
+  Enter: 13, Escape: 27, Backspace: 8, Tab: 9, Space: 32,
+  ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40,
+  Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34,
+  Shift: 16, Control: 17, Alt: 18, Meta: 91,
+  F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117,
+  F7: 118, F8: 119, F9: 120, F10: 121, F11: 122, F12: 123,
+};
+function vkOf(e) {
+  if (KEYMAP[e.key]) return KEYMAP[e.key];
+  if (e.key.length === 1) return e.key.toUpperCase().charCodeAt(0);
+  return 0;
+}
+window.addEventListener('keydown', (e) => {
+  if (!inputOn) return;
+  const vk = vkOf(e);
+  if (!vk) return;
+  e.preventDefault();
+  ctlSend({ t: 'input', k: 'key', vk: vk, d: true });
+});
+window.addEventListener('keyup', (e) => {
+  if (!inputOn) return;
+  const vk = vkOf(e);
+  if (!vk) return;
+  e.preventDefault();
+  ctlSend({ t: 'input', k: 'key', vk: vk, d: false });
+});
+
+// ---- P2.1 质量上报：每 3 秒把上屏帧率/丢包/RTT/缓冲发给宿主，由其给出码率建议 ----
+setInterval(() => {
+  if (!dc || dc.readyState !== 'open') return;
+  if (!pc || pc.connectionState !== 'connected') return;
+  ctlSend({
+    t: 'stat',
+    fps: Math.round(lastFps * 10) / 10,
+    loss: Math.round(lastLossPct * 100) / 100,
+    rtt: Math.round(lastRtt),
+    jb: Math.round(lastJb),
+  });
+}, 3000);
 </script>
 </body>
 </html>
