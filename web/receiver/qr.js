@@ -184,17 +184,24 @@
     setF(4 * VERSION + 9, 8, 1);
 
     // 格式信息（掩码固定 0）
+    //
+    // 注意位序：fmt 的 bit i（i 从 0 起，bit0 为最低位）分别写入两处镜像位置。
+    // 垂直（左列）：i<6 写 (i,8)；i=6,7 跳过定时列写 (i+1,8)；i>=8 写 (SIZE-15+i, 8)
+    // 水平（上行）：i<8 写 (8, SIZE-1-i)；i=8 写 (8, 7)；i>8 写 (8, 14-i)
+    //
+    // 这里曾误写成 (14-i, 8)，i=8..14 会落进行号 6..0（定位图形区域），
+    // 导致扫描器读不到格式信息、整张码无法解码。
     const fmt = formatInfo(0);
     for (let i = 0; i < 15; i++) {
       const bit = (fmt >> i) & 1;
-      // 左上：跳过定时线所在行列
-      if (i < 6) setF(8, i, bit);
-      else if (i < 8) setF(8, i + 1, bit);
-      else if (i === 8) setF(7, 8, bit);
-      else setF(14 - i, 8, bit);
-      // 右上 / 左下
-      if (i < 8) setF(SIZE - 1 - i, 8, bit);
-      else setF(8, SIZE - 15 + i, bit);
+      // 垂直部分（左侧一列）
+      if (i < 6) setF(i, 8, bit);
+      else if (i < 8) setF(i + 1, 8, bit);
+      else setF(SIZE - 15 + i, 8, bit);
+      // 水平部分（上侧一行）
+      if (i < 8) setF(8, SIZE - 1 - i, bit);
+      else if (i === 8) setF(8, 7, bit);
+      else setF(8, 14 - i, bit);
     }
 
     // 数据位（zigzag，从右下开始，跳过第 6 列）
