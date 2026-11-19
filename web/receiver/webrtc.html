@@ -139,6 +139,22 @@ function send(obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+// ---- P2.7 连接状态 UI：把底层状态翻译成人能看懂的四态 ----
+// 必须在 buildPeerConnection 之前可用（脚本内函数声明会提升，但仍放在前面更清晰）
+function renderState(state) {
+  const box = el('state');
+  if (!box) return;
+  const map = {
+    connecting: ['连接中…', 'warn'],
+    connected: ['已连接', 'ok'],
+    reconnecting: ['重连中…', 'warn'],
+    failed: ['连接失败', 'bad'],
+  };
+  const [text, cls] = map[state] || ['未连接', ''];
+  box.textContent = text;
+  box.className = 'pill ' + cls;
+}
+
 function buildPeerConnection() {
   pc = new RTCPeerConnection({ iceServers: [] });   // 与宿主一致：只收 host candidate
 
