@@ -9,6 +9,14 @@ use remote_screen_core::json_escape;
 use remote_screen_host_win::displays::enumerate_displays;
 
 fn main() {
+    // webrtc-rs / DTLS 层日志。默认只显示 warn，避免刷屏；
+    // 排查 DTLS 握手失败等问题时用环境变量打开，例如：
+    //   RUST_LOG=webrtc_dtls=debug,webrtc=debug rs-host stream-webrtc ...
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn"),
+    )
+    .try_init();
+
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let json = args.iter().any(|a| a == "--json");

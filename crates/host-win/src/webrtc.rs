@@ -170,6 +170,15 @@ pub fn build_api() -> Result<webrtc::api::API, String> {
     // 而 `enable_rtx` 就是这个 setting。默认 false → add_track 根本不建 RTX 流，
     // 于是 SDP 里只有 a=rtpmap rtx 却没有 a=ssrc-group:FID，浏览器不认重传。
     setting_engine.enable_sender_rtx(true);
+    // **收集 loopback（127.0.0.1）host 候选**。
+    //
+    // 默认 webrtc-rs 只发真实网卡地址（如 192.168.0.104）。当浏览器与宿主
+    // 在**同一台机器**上时，包要经过本机网卡地址回环，会被系统代理（TUN 模式）
+    // 或防火墙规则干扰，表现为 ICE 能连上、DTLS 握手始终失败（连接 failed）。
+    // 打开 loopback 候选后，本机客户端可直接走 127.0.0.1 建立，绕开这条路径。
+    //
+    // 对局域网其它设备无副作用：它们拿到 127.0.0.1 候选会快速探测失败并忽略。
+    setting_engine.set_include_loopback_candidate(true);
 
     Ok(APIBuilder::new()
         .with_media_engine(media_engine)

@@ -10,3 +10,15 @@ license = "MIT OR Apache-2.0"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# webrtc-rs 0.12 依赖 webrtc-dtls 0.11，而 0.11 的曲线协商只取客户端
+# supported_groups 的**第一个**曲线（flight0.rs: `e.elliptic_curves[0]`）。
+# 新版 Chromium 把后量子混合曲线 X25519MLKEM768(0x11ec) 排在首位，
+# 0.11 认不出 → NamedCurve::Unsupported → generate_keypair 报
+# ErrInvalidNamedCurve → DTLS 握手 Failed（表现为 ICE connected 但连接 failed，
+# 只有旧内核浏览器如华为浏览器能连）。
+# 上游 0.12.0 已改为遍历选取，但 webrtc-rs 0.12 的依赖约束是 ^0.11，
+# 无法仅靠升级版本号解决，故 vendor 一份 0.11 并修补该处（只改这一段）。
+[patch.crates-io]
+webrtc-dtls = { path = "vendor/webrtc-dtls" }
+

@@ -10,6 +10,7 @@ remote-screen-core = { path = "../core" }
 tungstenite = "0.21"
 # ---- P1.1 WebRTC 传输层（路线 A）----
 webrtc = "0.12"          # WebRTC 栈（pion 移植）：ICE/DTLS/SRTP/TURN/DataChannel
+env_logger = "0.11"      # webrtc-rs / DTLS 层日志（RUST_LOG 控制，默认 warn 静默）
 rtp = "0.12"             # RTP 层：H264Payloader 自动做 STAP-A + FU-A
 bytes = "1"              # webrtc/rtp 的 Bytes 类型
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
