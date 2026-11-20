@@ -149,18 +149,23 @@ WS 信令     : ws://192.168.0.107:8787
 产出率与码率无关，是「1280x720 单帧 3.7MB × 60fps = 221MB/s」超出当前
 D3D11 回读 + QSV 编码的吞吐。**建议该分辨率配 30fps**（编码压力减半）。
 
-### 4.2 华为平板渲染上屏帧率上限约 30-35fps
+### 4.2 上屏帧率与发送帧率的匹配关系（结论已修正）
 
 实测（华为平板 + 华为浏览器）：
 
-| 发送帧率 | 上屏帧率 | `framesDecoded` | `framesDropped` |
+| 发送帧率 | 上屏帧率 | 呈现率 | `framesDropped` |
 |---|---|---|---|
-| 20 fps | 13-14 | = framesReceived | 0 |
-| 60 fps | 29-35 | = framesReceived | 0 |
+| 20 fps | 13-14 | 68% | 0 |
+| 30 fps | **30.0** | **100%** | 0 |
+| 60 fps | 29-35 | 55% | 0 |
 
-解码完整、无丢帧，是渲染层主动跳帧。已排除：智能刷新率（固定 120Hz）、
-非整数缩放（1:1 原始尺寸）、光标合成（`--no-cursor`）、DPI（100%）、
-全屏节流。属设备/浏览器限制，非宿主可解。
+**结论修正**：这不是「渲染上限 30-35fps」的缺陷，而是**30fps 正好是这台平板的渲染工作点**。
+30fps 下每一帧都完整呈现（100%），60fps 反而因为要跳帧而只有 55%。
+
+**因此默认配置定为 30fps 是正确选择，不是妥协。**
+
+已排除的影响因素：智能刷新率（固定 120Hz）、非整数缩放（1:1 原始尺寸）、
+光标合成（`--no-cursor`）、DPI（100%）、全屏节流。
 
 **静止画面完全不抖、文字清晰**，桌面/文档/代码场景可用。
 
@@ -202,7 +207,91 @@ D3D11 回读 + QSV 编码的吞吐。**建议该分辨率配 30fps**（编码压
 
 ---
 
-## 七、下一步（P3 前的建议）
+## 七、后续修复记录（2026-11-19 ~ 11-20 实测发现）
+
+P2 交付后连续出现四个独立问题，逐一定位并修复。**它们是四个不同的 bug，不是同一个问题的反复**。
+
+### 7.1 连接黑屏：`renderState is not defined`（提交 `913bfa0`）
+
+P2.7 在 `buildPeerConnection()` 里调用了 `renderState('connecting')`，
+但函数定义在编辑过程中被漏掉。
+
+故障链：收到 offer → `buildPeerConnection()` → `ReferenceError` →
+**answer 永远不生成** → 宿主 `conn` 停在 `New` → 平板黑屏。
+
+**教训**：`new Function()` 语法检查查不出「引用未定义标识符」这类运行时错误。
+前端改动必须做一次浏览器运行时验证（抓 `pageerror`）。
+
+### 7.2 扫码无反应：QR 格式信息位置写错（提交 `ebe3365`）
+
+`qr.js` 里格式信息的垂直部分误写成 `setF(14 - i, 8, bit)`，
+`i=8..14` 时行号落在 6..0，**写进了左上定位图形区域**；正确应为 `setF(SIZE-15+i, 8, bit)`（行 22..28）。
+
+后果：扫描器读不到纠错等级/掩码 → 整张码无法解码。
+
+**验证方式升级**（结构检查发现不了位置错误）：
+反向读取矩阵 → 格式信息两处镜像位置均读出 `0x77C4`；
+反向 zigzag 提取 70 个码字 → **RS 自校验通过**（任何一格错位都会破坏校验）；
+解析出 `0100` Byte / 37 字节 / 与原 URL 完全一致。
+
+### 7.3 新版 Chromium 连不上：DTLS 曲线协商缺陷（提交 `da64a16`）★ 最重要
+
+**现象**：`ICE connected` 但 `connection failed`，画面全黑。旧内核浏览器（华为浏览器）正常，
+新版 Edge/Chrome 必失败。
+
+**定位过程**：先用浏览器 `getStats()` 确认 Edge 已选中 `127.0.0.1` loopback 候选且
+`nominated`（排除网络/代理干扰），再开 `RUST_LOG=webrtc_dtls=trace` 拿到：
+
+```
+Flight 0 result alert: Some(Fatal / IllegalParameter), err: Some(ErrInvalidNamedCurve)
+Failed to start manager dtls: invalid named curve
+```
+
+**根因**：`webrtc-dtls 0.11` 的 `flight0.rs` 只取客户端 `supported_groups` 的**第一个**曲线：
+
+```rust
+state.named_curve = e.elliptic_curves[0];   // 不遍历！
+```
+
+新版 Chromium 把后量子混合曲线 `X25519MLKEM768 (0x11ec)` 排在首位，
+`NamedCurve::from(0x11ec)` 得到 `Unsupported` → `generate_keypair()` 报
+`ErrInvalidNamedCurve` → 握手直接失败。RFC 5246 要求遍历选取双方都支持的曲线，
+上游 `webrtc-dtls 0.12.0` 已按此修正。
+
+**修复**：`webrtc-rs 0.12` 的依赖约束是 `^0.11`，无法直接升版本，故
+**vendor 一份 0.11（903K）只改这一段**为遍历选取，用 `[patch.crates-io]` 指向 `vendor/webrtc-dtls`。
+
+**验证**：修复前本机 Edge 必失败；修复后
+
+```
+connectionState: connected / iceConnectionState: connected
+[webrtc] #1 诊断 conn=Connected ice=Connected
+```
+
+**长期影响**：Chrome/Edge 会越来越普遍默认启用 PQ 曲线，所有基于 webrtc-rs 0.12 的项目都会踩到，
+建议后续关注上游把 webrtc-rs 依赖提到 webrtc-dtls 0.12+，届时可移除 vendor。
+
+### 7.4 附带改进
+
+- **loopback ICE 候选**（`set_include_loopback_candidate(true)`）：本机自测可走 127.0.0.1，
+  绕开网卡地址路径；对局域网其它设备无副作用（它们探测失败后忽略）。
+- **env_logger**：默认 `warn` 静默；排查用 `RUST_LOG=webrtc_dtls=trace,webrtc=info`。
+  这是本次能定位 DTLS 根因的关键工具，建议保留。
+
+### 7.5 修复后完整验证（本机 Edge）
+
+```
+[ctl] #1 设备：CSS 1280x720 · DPR 1.00 · 横屏 · 物理 1280x720
+[ctl] #1 建议虚拟屏模式：1280x720@60
+[ctl] #1 质量：上屏 30.0fps 丢包 0.00% RTT 1ms 缓冲 9ms → 链路良好
+[webrtc] #1 诊断 conn=Connected ice=Connected 已写入 270 帧
+```
+
+P2.1 / P2.3v2 / P2.7 三项在同一次连接中全部生效。
+
+---
+
+## 八、下一步（P3 前的建议）
 
 1. **输入回传实测**：`--allow-input` + 平板「控制本机」，确认拖动窗口、点击、滚轮、键盘都正常，
    重点看**坐标是否偏移**（虚拟屏 1280x720 在桌面中的位置）。
