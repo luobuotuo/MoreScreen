@@ -547,6 +547,7 @@ video.addEventListener('pointerdown', (e) => {
   ctlSend({ t: 'input', k: 'm', x: p.x, y: p.y });
   ctlSend({ t: 'input', k: 'b', btn: 'left', d: true });
   dragging = true;
+  L('↓ 按下（左键）');
   try { video.setPointerCapture(e.pointerId); } catch (_) {}
   // 长按 500ms 视为右键（移动端没有右键）
   clearLongPress();
@@ -584,8 +585,10 @@ function endDrag(e) {
   ctlSend({ t: 'input', k: 'b', btn: 'left', d: false });
   try { video.releasePointerCapture(e.pointerId); } catch (_) {}
 }
-video.addEventListener('pointerup', endDrag);
-video.addEventListener('pointercancel', endDrag);
+video.addEventListener('pointerup', (e) => { L('↑ 抬起'); endDrag(e); });
+// pointercancel = 浏览器把手势"抢走"了（当滚动/缩放处理）。出现它说明触摸没被
+// 当成原生拖拽，是我们的 bug；不出现却拖不动，则要怀疑 Windows 的焦点激活行为。
+video.addEventListener('pointercancel', (e) => { L('⚠️ 手势被浏览器取消(pointercancel)'); endDrag(e); });
 
 // 滚轮：一格 = 120
 video.addEventListener('wheel', (e) => {
