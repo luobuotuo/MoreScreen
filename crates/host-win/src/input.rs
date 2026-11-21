@@ -28,13 +28,29 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
     MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SetProcessDPIAware, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
 
 /// 全局输入开关：只有显式 `--allow-input` 才打开。
 static INPUT_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// 目标显示器的区域（虚拟桌面坐标系）。
 static TARGET: std::sync::Mutex<(i32, i32, u32, u32)> = std::sync::Mutex::new((0, 0, 0, 0));
+
+/// 让进程使用物理像素坐标（必须在任何 GDI / SendInput 调用之前执行）。
+///
+/// 实测：DPI 无关的进程在高 DPI 主屏（125%）上，`GetSystemMetrics` 报 1536x864，
+/// 而 `EnumDisplaySettings` 的 dmPosition/dmPelsWidth 报物理 1920x1080。
+/// 两套口径混用会让输入落点在屏幕右侧/下侧系统性偏移，且这些区域根本投不到。
+/// 声明 DPI 感知后两处口径统一为物理像素。
+pub fn init_dpi_awareness() {
+    unsafe {
+        // 返回 false 表示进程已声明过感知，属正常情况，忽略即可。
+        let _ = SetProcessDPIAware();
+    }
+}
 
 /// 打开输入回传开关。
 pub fn enable() {
@@ -53,15 +69,20 @@ pub fn set_target_rect(x: i32, y: i32, width: u32, height: u32) {
     }
 }
 
-/// 虚拟桌面总尺寸（多屏拼接后的整体），SendInput 的绝对坐标以此归一化。
-fn virtual_desktop_size() -> (i32, i32) {
+/// 虚拟桌面的原点与总尺寸（多屏拼接后的整体），SendInput 的绝对坐标以此归一化。
+///
+/// 原点必须为 (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN)：当某块屏被放在主屏左侧/上方时原点为负，
+/// 少了这一步会把坐标整体平移，光标落点系统性偏移一整块屏的宽度。
+fn virtual_desktop_geometry() -> (i32, i32, i32, i32) {
     unsafe {
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         if w <= 0 || h <= 0 {
-            (1920, 1080)
+            (0, 0, 1920, 1080)
         } else {
-            (w, h)
+            (x, y, w, h)
         }
     }
 }
@@ -74,13 +95,15 @@ fn map_to_absolute(nx: f64, ny: f64) -> Option<(i32, i32)> {
     if tw == 0 || th == 0 {
         return None;
     }
-    let (vdx, vdy) = virtual_desktop_size();
+    let (ox, oy, vdw, vdh) = virtual_desktop_geometry();
     let nx = nx.clamp(0.0, 1.0);
     let ny = ny.clamp(0.0, 1.0);
     let abs_x = tx as f64 + nx * tw as f64;
     let abs_y = ty as f64 + ny * th as f64;
-    let sx = (abs_x / vdx as f64 * 65535.0).round() as i32;
-    let sy = (abs_y / vdy as f64 * 65535.0).round() as i32;
+    // MOUSEEVENTF_VIRTUALDESK 的 0~65535 是相对整个虚拟桌面矩形的，
+    // 必须先减去虚拟桌面原点（可能为负），再除以总尺寸。
+    let sx = ((abs_x - ox as f64) / vdw as f64 * 65535.0).round() as i32;
+    let sy = ((abs_y - oy as f64) / vdh as f64 * 65535.0).round() as i32;
     Some((sx.clamp(0, 65535), sy.clamp(0, 65535)))
 }
 

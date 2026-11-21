@@ -9,6 +9,10 @@ use remote_screen_core::json_escape;
 use remote_screen_host_win::displays::enumerate_displays;
 
 fn main() {
+    // 必须在任何 GDI/SendInput 调用前声明 DPI 感知，否则高 DPI 主机上
+    // GetSystemMetrics 与 EnumDisplaySettings 坐标口径不一致，输入落点会系统性偏移。
+    remote_screen_host_win::input::init_dpi_awareness();
+
     // webrtc-rs / DTLS 层日志。默认只显示 warn，避免刷屏；
     // 排查 DTLS 握手失败等问题时用环境变量打开，例如：
     //   RUST_LOG=webrtc_dtls=debug,webrtc=debug rs-host stream-webrtc ...
