@@ -121,6 +121,7 @@ let inputOn = false;        // 输入回传开关（默认关，避免误操作�
 let lastMoveSent = 0;       // 鼠标移动节流时间戳（毫秒）
 // 供质量上报使用的最近一次统计值
 let lastFps = 0, lastLossPct = 0, lastRtt = 0, lastJb = 0;
+let statsTimer = null;   // getStats 轮询定时器：重连时必须清理，否则会累积多个
 
 /// 通过控制通道发一条 JSON；通道未就绪时静默丢弃。
 function ctlSend(obj) {
@@ -224,6 +225,7 @@ function doReconnect() {
   closingForReconnect = false;
   lastOfferSdp = '';
   firstFrameLogged = false;        // 重连后重新统计首帧
+  lastFps = 0; lastLossPct = 0; lastRtt = 0; lastJb = 0;   // 清掉上一会话的统计残留
   try { video.srcObject = null; } catch (_) {}
   reconnInFlight = false;          // 允许这次重连失败后再次调度
   renderState('connecting');
@@ -252,6 +254,10 @@ function renderState(state) {
 }
 
 function buildPeerConnection() {
+  // 重连会重新建 PC。若不清掉上一轮的统计定时器：
+  // ① 旧 interval 继续跑，用新 PC 的 frames 减旧会话的累计 frames → 算出负 fps；
+  // ② 每重连一次就多一个定时器，getStats 调用翻倍。
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
   pc = new RTCPeerConnection({ iceServers: [] });   // 与宿主一致：只收 host candidate
 
   // 宿主在 offer 之前建了 `ctl` 数据通道，这里接收它。
@@ -344,7 +350,7 @@ function buildPeerConnection() {
   // 每秒采样一次：对外只给瞬时值（差分），累计值对判断卡顿没有意义
   let prev = null;
   let rawLogged = 0;
-  setInterval(async () => {
+  statsTimer = setInterval(async () => {
     if (!pc || pc.connectionState !== 'connected') return;
     let st;
     try { st = await pc.getStats(); } catch (e) { return; }
