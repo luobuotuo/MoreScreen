@@ -122,6 +122,8 @@ let lastMoveSent = 0;       // 鼠标移动节流时间戳（毫秒）
 // 供质量上报使用的最近一次统计值
 let lastFps = 0, lastLossPct = 0, lastRtt = 0, lastJb = 0;
 let statsTimer = null;   // getStats 轮询定时器：重连时必须清理，否则会累积多个
+let highJbSince = 0;     // 缓冲首次超过看门狗阈值的时刻
+let jbRescueCount = 0;   // 本页生命周期内主动重建次数（防无限循环）
 
 /// 通过控制通道发一条 JSON；通道未就绪时静默丢弃。
 function ctlSend(obj) {
@@ -399,6 +401,24 @@ function buildPeerConnection() {
     if (jbCount > 0) {
       lastJb = jbDelay * 1000 / jbCount;
       el('jb').textContent = lastJb.toFixed(0) + ' ms';
+    }
+
+    // ---- 高延迟看门狗 ----
+    // 弱网雪崩后，浏览器 jitterBuffer 只会渐进收缩：实测从 3.5s 回落到 126ms 要 5 分钟。
+    // 与其干等，不如主动重建会话把缓冲清零（黑屏 2~3 秒，但立刻可用）。
+    // 阈值 1000ms：正常 20~60ms、1Mbps 峰值 59ms；超过 1 秒操作已明显拖沓。
+    if (lastJb > 1000) {
+      if (!highJbSince) {
+        highJbSince = Date.now();
+      } else if (Date.now() - highJbSince >= 10000 && jbRescueCount < 3) {
+        highJbSince = 0;
+        jbRescueCount++;
+        L('⚠️ 缓冲持续 ' + Math.round(lastJb) + 'ms，主动重建会话（第 '
+          + jbRescueCount + '/3 次）', 'bad');
+        scheduleReconnect('缓冲过高');
+      }
+    } else {
+      highJbSince = 0;
     }
     // 缓冲清空次数：>0 说明浏览器在主动丢缓冲里的帧（累积延迟超限），
     // 这是「丢包 0 但丢帧持续涨」最可能的直接来源
