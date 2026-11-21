@@ -27,6 +27,15 @@
   #stage:fullscreen .tool,
   #stage:fullscreen .bar,
   #stage:fullscreen #log { display: none !important; }
+  /* 全屏时必须保留「控制本机」入口，否则全屏后没有任何途径开启输入回传。
+     做成角落的浮动小按钮，不干扰观感（退出全屏在右上，这个放左上）。 */
+  #stage:fullscreen #ctlbtn {
+    display: block !important; position: fixed; left: 10px; top: 10px; z-index: 9;
+    margin: 0; padding: 6px 10px; font-size: 12px;
+    background: rgba(0,0,0,.45); color: #cfd3d8;
+    border: 1px solid rgba(255,255,255,.18); border-radius: 6px;
+  }
+  #stage:fullscreen #ctlbtn.on { background: #1a73e8; color: #fff; border-color: #1a73e8; }
   /* 连接状态胶囊（P2.7 四态） */
   .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
           background: #26282e; color: #9aa0a6; border: 1px solid #33363d; }
@@ -389,6 +398,7 @@ el('start').addEventListener('click', () => {
   el('start').style.display = 'none';
   el('native').style.display = 'block';
   el('fs').style.display = 'block';
+  el('ctlbtn').style.display = 'block';   // 之前漏了：不显示就永远没法开启输入回传
   L('用户已确认开始接收');
   connectSignaling();
   // 必须在用户手势的同一个调用栈里请求全屏，否则会被浏览器拒绝
