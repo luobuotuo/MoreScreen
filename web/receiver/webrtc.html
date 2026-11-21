@@ -83,15 +83,15 @@
   <button id="fs" class="tool">进入全屏</button>
   <button id="ctlbtn" class="tool">控制本机</button>
   <button id="exitfs">退出全屏</button>
+  <!-- 本地光标必须在 #stage 内部：Fullscreen API 只渲染全屏元素的子树，
+       放在 stage 外面的话一进全屏就被丢弃（脚本仍在跑，只是看不见）。 -->
+  <svg id="cursor" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M3 2 L3 19.2 L7.3 15 L9.8 21.2 L12.7 19.9 L10.4 14 L16.2 14 Z"
+          fill="#ffffff" stroke="#000000" stroke-width="1.1" stroke-linejoin="round"/>
+  </svg>
   <div class="bar"><i id="bar"></i></div>
   <div id="log"></div>
 </div>
-
-<!-- 本地光标（宿主 --no-cursor 时由接收端绘制）：白色箭头 + 黑色描边 -->
-<svg id="cursor" viewBox="0 0 24 24" aria-hidden="true">
-  <path d="M3 2 L3 19.2 L7.3 15 L9.8 21.2 L12.7 19.9 L10.4 14 L16.2 14 Z"
-        fill="#ffffff" stroke="#000000" stroke-width="1.1" stroke-linejoin="round"/>
-</svg>
 
 <script>
 const el = id => document.getElementById(id);
