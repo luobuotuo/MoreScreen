@@ -7,6 +7,11 @@
 
 use remote_screen_core::json_escape;
 use remote_screen_host_win::displays::enumerate_displays;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// 输入回传诊断：各只报一次，避免刷屏。用于确认「控制通道什么时候才真正打通」。
+static FIRST_INPUT_LOGGED: AtomicBool = AtomicBool::new(false);
+static INPUT_DISABLED_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     // 必须在任何 GDI/SendInput 调用前声明 DPI 感知，否则高 DPI 主机上
@@ -657,7 +662,7 @@ fn main() {
                 let rtc = rtc.clone();
                 let hub_pump = hub.clone();
                 std::thread::spawn(move || {
-                    use remote_screen_host_win::webrtc::SignalOut;
+                    use remote_screen_host_win::webrtc::{SignalIn, SignalOut};
                     loop {
                         // 1) 新客户端接入 → 为它单独建一个会话
                         for id in hub_pump.poll_joined() {
@@ -709,7 +714,17 @@ fn main() {
                                     );
                                 }
                                 SignalOut::State(s) => println!("[webrtc] #{id} {s}"),
-                                SignalOut::Ctl(text) => handle_ctl(id, &text),
+                                SignalOut::Ctl(text) => {
+                                    // 通道回环自检：echo 原样回包，把「SCTP 通道不通」
+                                    // 与「SendInput 被拒绝」两层根因彻底分开。
+                                    if json_str(&text, "t").as_deref() == Some("echo") {
+                                        rtc.deliver(
+                                            id,
+                                            SignalIn::Ctl("{\"t\":\"echo-ok\"}".into()),
+                                        );
+                                    }
+                                    handle_ctl(id, &text);
+                                }
                             }
                         }
                         // 4) 浏览器 → 会话：answer / candidate，定向投递给所属会话
@@ -759,6 +774,7 @@ fn main() {
                         if stats.avg_interval_ms > 0.0 { 1000.0 / stats.avg_interval_ms } else { 0.0 },
                         stats.first_frame_delay_ms
                     );
+                    println!("  其中静止保活补帧: {} 帧（不计入上面的真实采集帧率）", stats.keepalive_frames);
                 }
                 Err(e) => eprintln!("采集失败: {e}"),
             }
@@ -976,7 +992,15 @@ fn handle_ctl(client_id: u64, text: &str) {
         }
         "input" => {
             if !remote_screen_host_win::input::input_enabled() {
-                return; // 未开启输入回传：静默忽略
+                if !INPUT_DISABLED_WARNED.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[ctl] 收到输入消息，但输入回传未启用（启动需加 --allow-input），已忽略"
+                    );
+                }
+                return;
+            }
+            if !FIRST_INPUT_LOGGED.swap(true, Ordering::Relaxed) {
+                println!("[ctl] #{client_id} 收到首条输入消息：控制通道已打通");
             }
             let k = json_str(text, "k").unwrap_or_default();
             match k.as_str() {

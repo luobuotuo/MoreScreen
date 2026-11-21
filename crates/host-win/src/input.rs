@@ -21,6 +21,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows::Win32::Foundation::GetLastError;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -118,6 +119,22 @@ fn map_to_absolute(nx: f64, ny: f64) -> Option<(i32, i32)> {
     Some((sx.clamp(0, 65535), sy.clamp(0, 65535)))
 }
 
+/// 注入输入并检查结果。SendInput 返回成功注入的条数，返回不足即被拒绝——
+/// 最典型是 UIPI：目标窗口完整性级别（管理员进程/部分系统 UI）高于本进程时，
+/// SendInput 会被静默丢弃。不检查返回值，「点击无响应」就永远无法区分
+/// 是通道断还是注入被拒（2026-11-21 补，定位根本原因的关键观测点）。
+fn send_input_checked(inputs: &[INPUT], what: &str) {
+    let ok = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if ok != inputs.len() as u32 {
+        let err = unsafe { GetLastError() }.0;
+        eprintln!(
+            "[input] SendInput 失败（{what}）：注入 {}/{}，GetLastError={err}（5=拒绝访问，典型为 UIPI：目标是提权窗口）",
+            ok,
+            inputs.len()
+        );
+    }
+}
+
 /// 发送一个鼠标输入事件。
 fn send_mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, mouse_data: i32) {
     let input = INPUT {
@@ -133,9 +150,7 @@ fn send_mouse(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS, mouse_data: i32) {
             },
         },
     };
-    unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    send_input_checked(&[input], "鼠标");
 }
 
 /// 把光标移动到画面内归一化位置。
@@ -204,7 +219,5 @@ pub fn key(vk: u16, down: bool) {
             },
         },
     };
-    unsafe {
-        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-    }
+    send_input_checked(&[input], "键盘");
 }

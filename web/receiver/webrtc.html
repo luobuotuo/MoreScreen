@@ -43,6 +43,7 @@
     border: 1px solid rgba(255,255,255,.18); border-radius: 6px;
   }
   #stage:fullscreen #ctlbtn.on { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+  #ctlbtn:disabled { opacity: .55; cursor: not-allowed; }
   /* 连接状态胶囊（P2.7 四态） */
   .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
           background: #26282e; color: #9aa0a6; border: 1px solid #33363d; }
@@ -82,6 +83,7 @@
   <span class="stat">重传 <b id="retx">—</b></span>
   <span class="stat">RTT <b id="rtt">—</b></span>
   <span class="stat">缓冲 <b id="jb">—</b></span>
+  <span class="stat">控制通道 <b id="dcstat">—</b></span>
 </header>
 
 <div id="stage">
@@ -89,7 +91,7 @@
   <button id="start">点击开始接收</button>
   <button id="native" class="tool">1:1 原始尺寸</button>
   <button id="fs" class="tool">进入全屏</button>
-  <button id="ctlbtn" class="tool">控制本机</button>
+  <button id="ctlbtn" class="tool" disabled>控制通道连接中…</button>
   <button id="exitfs">退出全屏</button>
   <!-- 本地光标必须在 #stage 内部：Fullscreen API 只渲染全屏元素的子树，
        放在 stage 外面的话一进全屏就被丢弃（脚本仍在跑，只是看不见）。 -->
@@ -120,6 +122,13 @@ const video = el('v');
 let dc = null;              // 控制 DataChannel（宿主创建，名 ctl）
 let inputOn = false;        // 输入回传开关（默认关，避免误操作主机）
 let lastMoveSent = 0;       // 鼠标移动节流时间戳（毫秒）
+// ---- 控制通道就绪状态（2026-11-21 实测修复）----
+// 症状：连接早期点击主机完全无响应（宿主物理屏也不动），几十秒后才生效。
+// 根因：ctlSend 在 dc 未 open 时静默丢消息，而按钮在「开始接收」瞬间就假就绪。
+let ctlQueue = [];          // 非输入消息暂存（有界 8 条），onopen 后补发
+let ctlWarnAt = 0;          // 「通道未就绪」提示节流
+let dcOpenAt = 0;           // dc.onopen 时刻，用于量化握手耗时
+let echoSentAt = 0;         // echo 回环自检发出时刻（测 SCTP 双向连通）
 // 供质量上报使用的最近一次统计值
 let lastFps = 0, lastLossPct = 0, lastRtt = 0, lastJb = 0;
 let statsTimer = null;   // getStats 轮询定时器：重连时必须清理，否则会累积多个
@@ -133,11 +142,65 @@ let fpsReconnected = false; // 重挂无效后是否已用重建会话兜底（�
 let resetStatsBaseline = false; // 从后台恢复时重置帧率差分基准
 let remoteStream = null;   // 远端流引用，供重挂视频轨使用
 
-/// 通过控制通道发一条 JSON；通道未就绪时静默丢弃。
+/// 通过控制通道发一条 JSON。
+/// 2026-11-21 实测修复：原来 dc 未 open 时静默丢弃，连接早期所有点击都失踪。
+/// 分三类处理：
+///   - input（鼠标/键盘）：丢弃并给出可见提示。**绝不排队回放**——几十秒攒下的
+///     按下/抬起一次性 flush 会在主机上变成一串乱点，比丢弃更糟；
+///   - stat（3 秒周期质量上报）：静默丢弃，下一周期自然补上；
+///   - device / hello 等：进有界队列，通道就绪后补发。
 function ctlSend(obj) {
-  if (dc && dc.readyState === 'open') {
-    try { dc.send(JSON.stringify(obj)); } catch (e) { /* 忽略瞬时错误 */ }
+  if (!dc || dc.readyState !== 'open') {
+    const t = obj && obj.t;
+    if (t === 'stat') return false;
+    if (t === 'input') {
+      const now = performance.now();
+      if (now - ctlWarnAt > 3000) {
+        ctlWarnAt = now;
+        L('⚠ 控制通道未就绪，本次操作未发送（readyState=' + (dc ? dc.readyState : 'null') + '）');
+      }
+      return false;
+    }
+    ctlQueue.push(JSON.stringify(obj));
+    if (ctlQueue.length > 8) ctlQueue.shift();
+    return false;
   }
+  try {
+    dc.send(JSON.stringify(obj));
+    return true;
+  } catch (e) {
+    L('⚠ 控制消息发送失败：' + (e && e.message ? e.message : e));
+    return false;
+  }
+}
+
+/// 通道就绪后补发暂存的非输入消息。
+function flushCtlQueue() {
+  if (!ctlQueue.length) return;
+  const q = ctlQueue.splice(0, ctlQueue.length);
+  for (const s of q) {
+    try { dc.send(s); }
+    catch (e) { L('⚠ 补发控制消息失败：' + (e && e.message ? e.message : e)); break; }
+  }
+}
+
+/// 统一复位控制态：新建 PC / 重连 / 通道关闭时都调用。
+/// 不清 dc 的话，重连后 dc 仍指向旧通道，输入会继续发进黑洞。
+function resetControlUI() {
+  const d = el('dcstat');
+  if (d) d.textContent = '连接中';
+  dc = null;
+  ctlQueue.length = 0;
+  inputOn = false;
+  dcOpenAt = 0;
+  const b = el('ctlbtn');
+  if (b) {
+    b.disabled = true;
+    b.textContent = '控制通道连接中…';
+    b.classList.remove('on');
+  }
+  video.classList.remove('controlling');
+  try { hideCursor(); } catch (_) {}
 }
 
 /// 上报本机显示信息（P2.3v2）：宿主据此推荐虚拟屏分辨率。
@@ -237,6 +300,7 @@ function doReconnect() {
   firstFrameLogged = false;        // 重连后重新统计首帧
   lastFps = 0; lastLossPct = 0; lastRtt = 0; lastJb = 0;   // 清掉上一会话的统计残留
   try { video.srcObject = null; } catch (_) {}
+  resetControlUI();                // 重连期间立刻禁用控制，避免输入发进旧通道
   reconnInFlight = false;          // 允许这次重连失败后再次调度
   renderState('connecting');
   connectSignaling();
@@ -268,21 +332,53 @@ function buildPeerConnection() {
   // ① 旧 interval 继续跑，用新 PC 的 frames 减旧会话的累计 frames → 算出负 fps；
   // ② 每重连一次就多一个定时器，getStats 调用翻倍。
   if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  resetControlUI();          // 清掉上一会话残留的 dc / 输入开关 / 按钮假就绪
   pc = new RTCPeerConnection({ iceServers: [] });   // 与宿主一致：只收 host candidate
 
   // 宿主在 offer 之前建了 `ctl` 数据通道，这里接收它。
   // 用途：输入回传（P2.5/P2.6）、设备信息上报（P2.3v2）、网络质量上报（P2.1）
   pc.ondatachannel = (e) => {
     if (e.channel.label !== 'ctl') return;
-    dc = e.channel;
-    dc.onopen = () => {
-      L('控制通道已就绪');
+    const ch = e.channel;
+    dc = ch;
+    L('收到控制通道（readyState=' + ch.readyState + '，开始接收后 '
+      + (tStart ? ((performance.now() - tStart) / 1000).toFixed(1) : '?') + 's）');
+    el('dcstat').textContent = ch.readyState === 'open' ? 'open' : '握手…';
+    const onOpen = () => {
+      if (dc !== ch) return;           // 旧通道迟到事件不得覆盖新会话
+      dcOpenAt = performance.now();
+      const secs = tStart ? ((dcOpenAt - tStart) / 1000).toFixed(1) : '?';
+      L('控制通道已就绪（开始接收后 ' + secs + 's）');
+      el('dcstat').textContent = 'open';
+      const b = el('ctlbtn');
+      if (b) { b.disabled = false; b.textContent = '控制本机'; }
+      flushCtlQueue();
       sendDeviceInfo();
+      // 通道回环自检：测 SCTP 双向连通，与 SendInput 是否被拒完全解耦
+      echoSentAt = performance.now();
+      ctlSend({ t: 'echo' });
     };
-    dc.onclose = () => L('控制通道已关闭', 'warn');
-    dc.onmessage = (ev) => {
+    ch.onopen = onOpen;
+    // 竞态兜底：若 ondatachannel 事件派发晚于 SCTP 流 open，onopen 事件已错过，
+    // 按钮将永远禁用——「点击按钮无响应」的一类直接根因。注册后立刻补查。
+    if (ch.readyState === 'open') onOpen();
+    ch.onclose = () => {
+      L('控制通道已关闭');
+      el('dcstat').textContent = 'closed';
+      if (dc === ch) resetControlUI();
+    };
+    ch.onmessage = (ev) => {
+      const d = ev.data;
+      // echo 回包：通道双向连通的硬证据，同时给出回环延迟
+      if (typeof d === 'string' && d.indexOf('echo-ok') >= 0) {
+        const ms = echoSentAt ? (performance.now() - echoSentAt).toFixed(0) : '?';
+        el('dcstat').textContent = 'open·' + ms + 'ms';
+        L('控制通道回环 ' + ms + ' ms：双向连通正常');
+        echoSentAt = 0;
+        return;
+      }
       // 宿主下发的状态（例如输入是否已启用）
-      L('宿主：' + ev.data);
+      L('宿主：' + d);
     };
   };
 
@@ -459,7 +555,12 @@ function buildPeerConnection() {
       // 解码自愈：页面可见、连接正常，但帧率长期 <8 → 内核卡在低帧节能态。
       // 先重挂视频轨（轻量，不黑屏），仍无效才重建会话（每页一次）。
       if (!bg && pc && pc.connectionState === 'connected') {
-        if (fpsNow < 8) {
+        // 码率同步塌掉 ⇒ 采集端没有新帧（WGC 静止不出帧），不是解码卡住。
+        // 这时重挂视频轨/重建会话都救不了，只会白黑屏，故只标注、不动作。
+        const noSource = kbps < 50;
+        if (fpsNow < 8 && noSource) {
+          lowFpsSince = 0;
+        } else if (fpsNow < 8) {
           if (!lowFpsSince) {
             lowFpsSince = Date.now();
           } else if (Date.now() - lowFpsSince >= 5000) {
@@ -557,7 +658,10 @@ el('start').addEventListener('click', () => {
   el('start').style.display = 'none';
   el('native').style.display = 'block';
   el('fs').style.display = 'block';
-  el('ctlbtn').style.display = 'block';   // 之前漏了：不显示就永远没法开启输入回传
+  // 只显示、不启用：真正的可用性由 dc.onopen 决定（否则是「假就绪」）
+  el('ctlbtn').style.display = 'block';
+  el('ctlbtn').disabled = true;
+  el('ctlbtn').textContent = '控制通道连接中…';
   L('用户已确认开始接收');
   connectSignaling();
   // 必须在用户手势的同一个调用栈里请求全屏，否则会被浏览器拒绝
@@ -657,6 +761,11 @@ function hideCursor() {
 }
 
 el('ctlbtn').addEventListener('click', () => {
+  // 双保险：即使有人手动解除了 disabled，也不允许在通道未就绪时进入控制态
+  if (!dc || dc.readyState !== 'open') {
+    L('⚠ 控制通道尚未就绪，请等待「控制通道已就绪」后再开启');
+    return;
+  }
   inputOn = !inputOn;
   el('ctlbtn').textContent = inputOn ? '停止控制' : '控制本机';
   el('ctlbtn').classList.toggle('on', inputOn);

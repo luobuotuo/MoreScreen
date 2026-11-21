@@ -37,6 +37,9 @@ const D3D11_SDK_VERSION: u32 = 7;
 #[derive(Debug, Clone, Default)]
 pub struct CaptureStats {
     pub frames: u64,
+    /// 静止保活补帧数：画面无变化时按目标帧率重复上一帧，**不计入 frames**，
+    /// 以免「采集结束: N 帧 / X fps」被保活帧虚高。
+    pub keepalive_frames: u64,
     pub first_frame_delay_ms: f64,
     pub avg_interval_ms: f64,
     pub max_interval_ms: f64,
@@ -368,6 +371,15 @@ where
             std::time::Duration::from_micros(0)
         };
         let mut last_push: Option<Instant> = None;
+        // 静止保活用的上一帧缓存（BGRA）。只有成功送出一帧后才有值。
+        let mut last_bgra: Option<Vec<u8>> = None;
+        // 保活间隔：未限帧（target_fps=0）时 min_interval 为 0，
+        // 若直接拿它当保活阈值会每 2ms 补一帧，故退回 ~30fps。
+        let keepalive_interval = if target_fps > 0 {
+            min_interval
+        } else {
+            std::time::Duration::from_millis(33)
+        };
 
         while (start.elapsed().as_millis() as u64) < duration_ms {
             match pool.TryGetNextFrame() {
@@ -413,9 +425,23 @@ where
                         }
                         last_push = Some(now);
                         on_frame(&bgra)?;
+                        last_bgra = Some(bgra);   // 缓存供静止保活重复送帧
                     }
                 }
                 Err(_) => {
+                    // 静止保活（2026-11-21 实测修复）：
+                    // WGC 只在画面内容变化时给帧，完全静止时永不回调。
+                    // 没有保活的话编码→RTP→接收端上屏全部停摆，接收端 fps 随画面动静
+                    // 在 0~30 之间大幅波动，还会反复触发低帧自愈造成周期性黑屏。
+                    // 这里按目标帧率重复上一帧：编码器对相同帧只输出极小的 skip P 帧，
+                    // 码率几乎不增，但接收端能维持恒定帧率与即时的交互回显。
+                    if let (Some(buf), Some(lp)) = (&last_bgra, last_push) {
+                        if lp.elapsed() >= keepalive_interval {
+                            on_frame(buf)?;
+                            stats.keepalive_frames += 1;
+                            last_push = Some(Instant::now());
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
