@@ -43,6 +43,11 @@
   .bar { height: 4px; background: #26282e; border-radius: 2px; overflow: hidden; margin-top: 10px; }
   .bar > i { display: block; height: 100%; width: 0; background: #8ab4f8; transition: width .2s; }
   #log { margin-top: 12px; color: #9aa0a6; font-size: 12px; white-space: pre-wrap; max-height: 30vh; overflow: auto; }
+  /* 本地光标：宿主以 --no-cursor 启动时画面不含光标，
+     由接收端在这里自己画一个，位置跟手指/鼠标走——零延迟，不受编码帧率影响。 */
+  #cursor { position: fixed; left: 0; top: 0; width: 22px; height: 22px;
+            pointer-events: none; z-index: 9999; display: none;
+            filter: drop-shadow(0 0 1.2px rgba(0,0,0,.95)); will-change: transform; }
 </style>
 </head>
 <body>
@@ -72,6 +77,12 @@
   <div class="bar"><i id="bar"></i></div>
   <div id="log"></div>
 </div>
+
+<!-- 本地光标（宿主 --no-cursor 时由接收端绘制）：白色箭头 + 黑色描边 -->
+<svg id="cursor" viewBox="0 0 24 24" aria-hidden="true">
+  <path d="M3 2 L3 19.2 L7.3 15 L9.8 21.2 L12.7 19.9 L10.4 14 L16.2 14 Z"
+        fill="#ffffff" stroke="#000000" stroke-width="1.1" stroke-linejoin="round"/>
+</svg>
 
 <script>
 const el = id => document.getElementById(id);
@@ -448,6 +459,19 @@ el('native').addEventListener('click', () => {
 // ---- P2.5 / P2.6 输入回传 ----
 // 默认关闭：点「控制本机」才开启，避免误触控制到主机。
 // 用 Pointer Events 统一处理鼠标与触摸（对两者都适用）。
+// ---- 本地光标：宿主以 --no-cursor 启动时画面不含光标，由这里绘制 ----
+// 位置直接取触点/鼠标位置，不经过编码与网络，所以零延迟、不会随帧率抖动。
+function updateCursor(x, y) {
+  const c = el('cursor');
+  if (!c) return;
+  c.style.transform = 'translate(' + (x - 1) + 'px,' + (y - 1) + 'px)';
+  c.style.display = 'block';
+}
+function hideCursor() {
+  const c = el('cursor');
+  if (c) c.style.display = 'none';
+}
+
 el('ctlbtn').addEventListener('click', () => {
   inputOn = !inputOn;
   el('ctlbtn').textContent = inputOn ? '停止控制' : '控制本机';
@@ -456,6 +480,8 @@ el('ctlbtn').addEventListener('click', () => {
   if (inputOn) {
     sendDeviceInfo();
     ctlSend({ t: 'hello-input' });
+  } else {
+    hideCursor();
   }
 });
 
@@ -467,6 +493,7 @@ const clearLongPress = () => {
 
 video.addEventListener('pointerdown', (e) => {
   if (!inputOn) return;
+  updateCursor(e.clientX, e.clientY);
   const p = normCoords(e);
   if (!p) return;
   e.preventDefault();
@@ -489,14 +516,19 @@ video.addEventListener('pointerdown', (e) => {
 });
 
 video.addEventListener('pointermove', (e) => {
-  if (!inputOn || !dragging) return;
-  clearLongPress();   // 一旦开始移动就不再算长按
+  if (!inputOn) return;
+  updateCursor(e.clientX, e.clientY);   // 本地光标立即跟手，不等编码/网络
+  if (dragging) clearLongPress();       // 一旦开始移动就不再算长按
   // 节流到 ~60Hz：DataChannel 再多发也没意义，反而占带宽
   const now = performance.now();
   if (now - lastMoveSent < 16) return;
   lastMoveSent = now;
   const p = normCoords(e);
-  if (p) ctlSend({ t: 'input', k: 'm', x: p.x, y: p.y });
+  if (!p) return;
+  // 鼠标：悬停也移动主机光标；触摸屏没有 hover，只有按住拖动时才发
+  if (e.pointerType === 'mouse' || dragging) {
+    ctlSend({ t: 'input', k: 'm', x: p.x, y: p.y });
+  }
 });
 
 function endDrag(e) {
