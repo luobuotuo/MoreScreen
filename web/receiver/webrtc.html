@@ -532,6 +532,18 @@ el('ctlbtn').addEventListener('click', () => {
 });
 
 let dragging = false;
+// ---- 双指滚动 ----
+// 移动端浏览器不会为双指滑动产生 wheel 事件（wheel 是桌面滚轮/触控板机制），
+// 所以只能自己从多点触控合成：两根手指的纵向平均位移累计到阈值就发一格滚轮。
+let twoFinger = false;
+let twoFingerLastAvgY = 0;
+let twoFingerAccum = 0;
+const SCROLL_STEP_PX = 28;              // 折算一格滚轮(120)所需的累计位移
+const activePointers = new Map();       // pointerId -> clientY
+function twoFingerAvgY() {
+  const ys = [...activePointers.values()];
+  return ys.length >= 2 ? (ys[0] + ys[1]) / 2 : 0;
+}
 let longPressTimer = null;
 const clearLongPress = () => {
   if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
@@ -539,6 +551,25 @@ const clearLongPress = () => {
 
 video.addEventListener('pointerdown', (e) => {
   if (!inputOn) return;
+  activePointers.set(e.pointerId, e.clientY);
+
+  // 第二根手指落下 → 转成双指滚动，并撤销第一根手指已经造成的"按下"
+  if (activePointers.size === 2) {
+    if (dragging) {
+      dragging = false;
+      clearLongPress();
+      ctlSend({ t: 'input', k: 'b', btn: 'left', d: false });
+      try { video.releasePointerCapture(e.pointerId); } catch (_) {}
+    }
+    twoFinger = true;
+    twoFingerAccum = 0;
+    twoFingerLastAvgY = twoFingerAvgY();
+    L('✋ 双指滚动');
+    e.preventDefault();
+    return;
+  }
+  if (twoFinger || activePointers.size > 2) return;   // 三指及以上不处理
+
   updateCursor(e.clientX, e.clientY);
   const p = normCoords(e);
   if (!p) return;
@@ -564,6 +595,25 @@ video.addEventListener('pointerdown', (e) => {
 
 video.addEventListener('pointermove', (e) => {
   if (!inputOn) return;
+  if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, e.clientY);
+
+  // 双指滚动：按两指平均纵向位移累计发滚轮
+  if (twoFinger) {
+    if (activePointers.size >= 2) {
+      const avg = twoFingerAvgY();
+      twoFingerAccum += avg - twoFingerLastAvgY;
+      twoFingerLastAvgY = avg;
+      // 手指上滑(avg 变小) → 想看下面的内容 → 滚轮向下(-120)；反之 +120
+      while (Math.abs(twoFingerAccum) >= SCROLL_STEP_PX) {
+        const dir = twoFingerAccum > 0 ? 120 : -120;
+        ctlSend({ t: 'input', k: 'w', d: dir });
+        twoFingerAccum -= (twoFingerAccum > 0 ? SCROLL_STEP_PX : -SCROLL_STEP_PX);
+      }
+    }
+    e.preventDefault();
+    return;
+  }
+
   updateCursor(e.clientX, e.clientY);   // 本地光标立即跟手，不等编码/网络
   if (dragging) clearLongPress();       // 一旦开始移动就不再算长按
   // 节流到 ~60Hz：DataChannel 再多发也没意义，反而占带宽
@@ -585,10 +635,20 @@ function endDrag(e) {
   ctlSend({ t: 'input', k: 'b', btn: 'left', d: false });
   try { video.releasePointerCapture(e.pointerId); } catch (_) {}
 }
-video.addEventListener('pointerup', (e) => { L('↑ 抬起'); endDrag(e); });
+video.addEventListener('pointerup', (e) => {
+  activePointers.delete(e.pointerId);
+  if (activePointers.size < 2) twoFinger = false;
+  L('↑ 抬起');
+  endDrag(e);
+});
 // pointercancel = 浏览器把手势"抢走"了（当滚动/缩放处理）。出现它说明触摸没被
 // 当成原生拖拽，是我们的 bug；不出现却拖不动，则要怀疑 Windows 的焦点激活行为。
-video.addEventListener('pointercancel', (e) => { L('⚠️ 手势被浏览器取消(pointercancel)'); endDrag(e); });
+video.addEventListener('pointercancel', (e) => {
+  activePointers.delete(e.pointerId);
+  if (activePointers.size < 2) twoFinger = false;
+  L('⚠️ 手势被浏览器取消(pointercancel)');
+  endDrag(e);
+});
 
 // 滚轮：一格 = 120
 video.addEventListener('wheel', (e) => {
