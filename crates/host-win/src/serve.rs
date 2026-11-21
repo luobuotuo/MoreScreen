@@ -233,6 +233,7 @@ pub fn start_http(port: u16, root_dir: &str) -> std::io::Result<u16> {
                 Err(_) => continue,
             };
             let root = root.clone();
+            let port_bound = bound;   // u16 Copy：给 /api/addr 用，告诉前端真实端口
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 2048];
@@ -256,6 +257,15 @@ pub fn start_http(port: u16, root_dir: &str) -> std::io::Result<u16> {
 
                 let (status, ctype, body) = if unsafe_req {
                     ("403 Forbidden", "text/plain; charset=utf-8", b"forbidden".to_vec())
+                } else if rel == "api/addr" {
+                    // 告诉前端宿主的局域网地址：用 localhost 打开配对页时，
+                    // location.hostname 对平板毫无意义（那是平板自己的 localhost）。
+                    let ip = local_ipv4().unwrap_or_else(|| "127.0.0.1".to_string());
+                    (
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        format!("{{\"ip\":\"{}\",\"port\":{}}}", ip, port_bound).into_bytes(),
+                    )
                 } else {
                     let target = root.join(rel);
                     match std::fs::read(&target) {

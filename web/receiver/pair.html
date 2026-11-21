@@ -47,30 +47,59 @@
 
 <script src="qr.js"></script>
 <script>
-const target = location.protocol + '//' + location.hostname +
-               (location.port ? ':' + location.port : '') + '/webrtc.html';
-document.getElementById('url').textContent = target;
+// 生成平板真正能访问的地址。
+// 若本页是用 localhost / 127.0.0.1 打开的，location.hostname 对平板毫无意义
+// （那是平板自己的 localhost），必须向宿主要它的局域网 IP。
+async function resolveTarget() {
+  let host = location.hostname;
+  let port = location.port;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') {
+    try {
+      const r = await fetch('/api/addr', { cache: 'no-store' });
+      const j = await r.json();
+      if (j && j.ip && j.ip !== '127.0.0.1') {
+        host = j.ip;
+        if (j.port) port = String(j.port);
+      }
+    } catch (_) { /* 取不到就退回原样，至少本机自测可用 */ }
+  }
+  return location.protocol + '//' + host + (port ? ':' + port : '') + '/webrtc.html';
+}
 
 const canvas = document.getElementById('qr');
 const warn = document.getElementById('warn');
+let target = '';
 
-try {
-  const qr = window.QR && window.QR.encode(target);
-  if (qr) {
-    // 每模块 8px：29+8 静区 = 37 模块 → 296px，手机扫足够清晰
-    window.QR.drawTo(canvas, qr, 8);
-  } else {
+(async () => {
+  target = await resolveTarget();
+  document.getElementById('url').textContent = target;
+
+  // 还是回环地址，说明没拿到局域网 IP，平板必然打不开——明确告知，别让人白扫
+  if (/\/\/(localhost|127\.0\.0\.1)(:|\/)/.test(target)) {
+    warn.style.display = 'block';
+    warn.textContent = '⚠️ 当前是本机回环地址（localhost），平板无法访问。'
+      + '请改用 http://<本机局域网IP>:8788/pair.html 打开本页。';
+  }
+
+  try {
+    const qr = window.QR && window.QR.encode(target);
+    if (qr) {
+      // 每模块 8px：29+8 静区 = 37 模块 → 296px，手机扫足够清晰
+      window.QR.drawTo(canvas, qr, 8);
+    } else {
+      canvas.style.display = 'none';
+      warn.style.display = 'block';
+      warn.textContent = '地址过长，无法生成二维码，请手动输入上方地址。';
+    }
+  } catch (e) {
     canvas.style.display = 'none';
     warn.style.display = 'block';
-    warn.textContent = '地址过长，无法生成二维码，请手动输入上方地址。';
+    warn.textContent = '二维码生成失败（' + e.message + '），请手动输入上方地址。';
   }
-} catch (e) {
-  canvas.style.display = 'none';
-  warn.style.display = 'block';
-  warn.textContent = '二维码生成失败（' + e.message + '），请手动输入上方地址。';
-}
+})();
 
 document.getElementById('copy').addEventListener('click', async () => {
+  if (!target) return;   // 地址尚未解析完成
   try {
     await navigator.clipboard.writeText(target);
     document.getElementById('copy').textContent = '已复制';
@@ -86,6 +115,7 @@ document.getElementById('copy').addEventListener('click', async () => {
 });
 
 document.getElementById('open').addEventListener('click', () => {
+  if (!target) return;
   location.href = target;
 });
 </script>
