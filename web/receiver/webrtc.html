@@ -129,6 +129,48 @@ function normCoords(e) {
   };
 }
 let pc = null, ws = null, started = false;
+
+// ---- 同源多标签互斥（2026-11-21 实测补充）----
+// 同一浏览器同时开多个接收页，会各自解码同一路视频、互相抢 CPU/GPU：
+// 实测多开时上屏从 30fps 掉到 10~12fps、jitterBuffer 堆到 300ms+，拖动明显卡跳。
+// BroadcastChannel 只在同源同浏览器内通信，所以多设备（平板+电脑）不受影响。
+// 注意：检查必须是同步的——若在点击里 await，会丢失用户手势，导致全屏被浏览器拒绝。
+const TAB_BC = ('BroadcastChannel' in window) ? new BroadcastChannel('rs-receiver') : null;
+let otherTabActive = false;
+let tabHeartbeat = null;
+
+function setTabConflict(on) {
+  otherTabActive = on;
+  const b = el('start');
+  if (!b || started) return;
+  if (on) {
+    b.textContent = '请先关闭其它接收页';
+    b.disabled = true;
+    L('⚠️ 同一浏览器已有另一个标签页在接收：多开会互相拖慢解码，请关掉其它接收页', 'bad');
+  } else {
+    b.textContent = '点击开始接收';
+    b.disabled = false;
+  }
+}
+
+if (TAB_BC) {
+  TAB_BC.onmessage = (e) => {
+    const d = e.data || {};
+    if (d.q === 'who') {
+      if (started) TAB_BC.postMessage({ a: 'busy' });
+    } else if (d.a === 'busy' || d.h === 'alive') {
+      if (!started) setTabConflict(true);
+    } else if (d.h === 'bye') {
+      if (!started) setTabConflict(false);
+    }
+  };
+  // 页面一加载就探测：已有标签页在接收的话，直接禁用按钮，避免用户白点一次
+  try { TAB_BC.postMessage({ q: 'who' }); } catch (_) {}
+  window.addEventListener('pagehide', () => {
+    try { TAB_BC.postMessage({ h: 'bye' }); } catch (_) {}
+    if (tabHeartbeat) { clearInterval(tabHeartbeat); tabHeartbeat = null; }
+  });
+}
 let tStart = 0, firstFrameLogged = false;
 // 宿主只协商一次；重复处理同一份 offer 会让浏览器再发一个 answer，
 // 宿主侧从 stable 状态应用第二个 answer 非法，会直接判会话失败。
@@ -373,7 +415,18 @@ function connectSignaling() {
 
 el('start').addEventListener('click', () => {
   if (started) return;
+  // 同步检查：不 await，保住用户手势上下文（全屏依赖它）
+  if (otherTabActive) {
+    L('⚠️ 同一浏览器已有另一个标签页在接收，请先关闭它再点开始', 'bad');
+    return;
+  }
   started = true;
+  // 开始接收后广播心跳，让后打开的标签页立刻知道"已有人在用"
+  if (TAB_BC) {
+    tabHeartbeat = setInterval(() => {
+      try { TAB_BC.postMessage({ h: 'alive' }); } catch (_) {}
+    }, 1000);
+  }
   tStart = performance.now();
   el('start').style.display = 'none';
   el('native').style.display = 'block';
