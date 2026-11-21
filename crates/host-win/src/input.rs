@@ -21,6 +21,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use windows::Win32::UI::HiDpi::{
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -47,7 +50,15 @@ static TARGET: std::sync::Mutex<(i32, i32, u32, u32)> = std::sync::Mutex::new((0
 /// 声明 DPI 感知后两处口径统一为物理像素。
 pub fn init_dpi_awareness() {
     unsafe {
-        // 返回 false 表示进程已声明过感知，属正常情况，忽略即可。
+        // 必须用 per-monitor v2：本机主屏 125%、虚拟屏 100%，两种 DPI 并存。
+        // system-DPI-aware 下所有坐标按主屏 DPI 当逻辑坐标换算，光标跨屏时会被
+        // ×0.8 / ×1.25 重定位——实测表现为点击虚拟屏却落到主屏的窗口上。
+        // per-monitor v2 让每个坐标都以物理像素解释，跨屏不再换算。
+        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).is_ok() {
+            return;
+        }
+        // 老系统（Win7/早期 Win8）不支持 v2，回退到 system-aware，
+        // 单显示器或无 DPI 混合时仍然正确。
         let _ = SetProcessDPIAware();
     }
 }
