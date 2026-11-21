@@ -278,8 +278,11 @@ pub fn start_http(port: u16, root_dir: &str) -> std::io::Result<u16> {
                     }
                 };
 
+                // 必须禁缓存：接收端页面是实时从磁盘读的，但浏览器对没有
+                // Cache-Control / ETag 的 HTML 会做启发式缓存，导致「改了前端、
+                // 刷新后仍跑旧代码」。局域网文件很小，每次重传成本可忽略。
                 let header = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\nAccept-Ranges: none\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(header.as_bytes());
