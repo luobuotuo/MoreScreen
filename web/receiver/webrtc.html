@@ -25,7 +25,11 @@
   video.controlling { touch-action: none; }
   /* 全屏沉浸：只留画面，其余 UI 全部隐藏 */
   #stage:fullscreen { padding: 0; display: flex; align-items: center; justify-content: center; background: #000; }
-  #stage:fullscreen video { width: auto; height: 100vh; max-width: 100vw; border-radius: 0; }
+  /* 宽高都必须是 auto + 双 max，元素才能保持视频内容比例。
+     写成 height:100vh 会把元素撑成视口比例，浏览器随后在元素内部加 letterbox 黑边，
+     归一化坐标一旦把黑边算进去，注入位置就会整体偏移（实测表现为
+     「光标要放到窗口标题栏上边框才能拖动」「任务栏图标只有特定位置点得到」）。 */
+  #stage:fullscreen video { width: auto; height: auto; max-width: 100vw; max-height: 100vh; border-radius: 0; }
   #stage:fullscreen #start,
   #stage:fullscreen .tool,
   #stage:fullscreen .bar,
@@ -143,9 +147,36 @@ function sendDeviceInfo() {
 
 /// 把画面内的指针位置换算成 0~1 归一化坐标（左上原点）。
 /// 用 video 元素的渲染矩形，而非窗口，这样缩放/留白都正确。
-function normCoords(e) {
+// 视频内容在页面上的真实显示矩形。
+// <video> 元素的比例与视频内容比例不一致时，浏览器会在元素内部加黑边（letterbox），
+// 此时 getBoundingClientRect() 返回的是"含黑边"的盒子，直接拿它归一化会让注入坐标偏移。
+// 这里按 videoWidth/videoHeight 反算内容实际占据的矩形，黑边区不计入。
+function contentRect() {
   const r = video.getBoundingClientRect();
+  const vw = video.videoWidth || 0;
+  const vh = video.videoHeight || 0;
   if (!r.width || !r.height) return null;
+  if (!vw || !vh) return r;            // 元数据还没到，退回元素矩形
+  const vidRatio = vw / vh;
+  const boxRatio = r.width / r.height;
+  let width, height, left, top;
+  if (vidRatio > boxRatio) {           // 内容更宽 → 上下黑边
+    width = r.width;
+    height = width / vidRatio;
+    left = r.left;
+    top = r.top + (r.height - height) / 2;
+  } else {                             // 内容更高 → 左右黑边
+    height = r.height;
+    width = height * vidRatio;
+    left = r.left + (r.width - width) / 2;
+    top = r.top;
+  }
+  return { left, top, width, height };
+}
+
+function normCoords(e) {
+  const r = contentRect();
+  if (!r || !r.width || !r.height) return null;
   return {
     x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
     y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
