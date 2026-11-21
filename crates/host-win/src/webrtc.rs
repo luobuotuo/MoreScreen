@@ -169,6 +169,12 @@ pub fn build_api() -> Result<webrtc::api::API, String> {
     // `create_rtx_stream = self.enable_rtx && media_engine 有 rtx codec`，
     // 而 `enable_rtx` 就是这个 setting。默认 false → add_track 根本不建 RTX 流，
     // 于是 SDP 里只有 a=rtpmap rtx 却没有 a=ssrc-group:FID，浏览器不认重传。
+    //
+    // 实测结论（2026-11-21）：必须开启。
+    // webrtc-rs 0.12 的 nack::Responder 重传时直接写**原始 RTP 包**（原 SSRC / 原 PT），
+    // 浏览器对这种重传一律丢弃（retx 恒为 0）。关闭 RTX 让浏览器「只能收原 SSRC 重传」
+    // 也不行（实测仍 0/186）。正确做法是 RFC 4588：重发包要改写成 RTX SSRC + RTX PT
+    // + 独立序列号，payload 前置原序列号 —— 该改写已在 vendor/interceptor 中实现。
     setting_engine.enable_sender_rtx(true);
     // **收集 loopback（127.0.0.1）host 候选**。
     //
@@ -394,12 +400,28 @@ async fn run_once(
         .map_err(|e| format!("new_peer_connection 失败: {e}"))?;
 
     // ---- 2. 建 H.264 视频轨并加入连接 ----
+    // ⚠ 这里的 rtcp_feedback 不能为空。
+    // webrtc-rs 用 **track 自己的 codec** 构造 StreamInfo（rtp_sender/mod.rs:480-488），
+    // 而 interceptor 的 nack::Responder 在 bind_local_stream 里靠
+    // `stream_support_nack(info)` 决定要不要建重传缓存。
+    // 为空 → 不建缓存 → 浏览器发来的 NACK 全部静默丢弃
+    // （实测 nack 累计 900+、接收端重传恒为 0，且无任何报错）。
+    // 注意：注册给 media_engine 的那份只影响 SDP 协商，管不到这条路径。
     let codec = RTCRtpCodecCapability {
         mime_type: "video/H264".to_owned(),
         clock_rate: 90000,
         channels: 0,
         sdp_fmtp_line: H264_FMTP.to_owned(),
-        rtcp_feedback: vec![],
+        rtcp_feedback: vec![
+            webrtc::rtp_transceiver::RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: String::new(),
+            },
+            webrtc::rtp_transceiver::RTCPFeedback {
+                typ: "nack".to_owned(),
+                parameter: "pli".to_owned(),
+            },
+        ],
     };
     let track = Arc::new(TrackLocalStaticSample::new(
         codec,
@@ -430,11 +452,32 @@ async fn run_once(
     {
         let reader = sender.clone();
         tokio::spawn(async move {
+            // 累计 NACK 计数，每 60 秒汇总一次（仅在非零时打印），
+            // 用于弱网测试观测：NACK 有量而接收端「重传」仍为 0 即代表重传链路异常。
+            let mut n_nack: u64 = 0;
+            let mut last = std::time::Instant::now();
             loop {
                 match reader.read_rtcp().await {
-                    // interceptor 已在读取过程中处理完 NACK / RR / PLI，
-                    // 这里只需要持续驱动读取，不需要解析包体
-                    Ok(_pkts) => {}
+                    // interceptor 已在读取过程中完成 NACK 匹配与重传，
+                    // 这里只负责持续驱动读取，否则 RTCP 会停在 socket 缓冲区。
+                    Ok((pkts, _attrs)) => {
+                        for p in pkts.iter() {
+                            let d = format!("{p:?}");
+                            let t = d
+                                .split(|c: char| c == '(' || c == '{' || c == ' ')
+                                .next()
+                                .unwrap_or("?");
+                            if t == "TransportLayerNack" {
+                                n_nack += 1;
+                            }
+                        }
+                        if last.elapsed().as_secs() >= 60 {
+                            if n_nack > 0 {
+                                eprintln!("[rtcp] 累计 NACK {n_nack}");
+                            }
+                            last = std::time::Instant::now();
+                        }
+                    }
                     Err(_) => break,
                 }
             }

@@ -21,4 +21,6 @@ lto = "thin"
 # 无法仅靠升级版本号解决，故 vendor 一份 0.11 并修补该处（只改这一段）。
 [patch.crates-io]
 webrtc-dtls = { path = "vendor/webrtc-dtls" }
+# 临时：给 nack responder 加诊断日志，定位「NACK 到达但不重传」
+interceptor = { path = "vendor/interceptor" }
 

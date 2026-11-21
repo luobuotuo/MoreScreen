@@ -108,6 +108,48 @@ jitterBuffer 堆到 3.5 秒且**不再回落**。
 **已加兜底（2026-11-21）**：接收端"高延迟看门狗"——缓冲 >1000ms 持续 10 秒即主动重建
 会话（复用自动重连，黑屏 2~3 秒换取立即恢复），每页最多 3 次。
 
+### P1.4.0 RTX 重传修复（2026-11-21，P1.4.2 的前置条件）
+
+**症状**：3% 丢包下接收端显示 `重传 0 / 1564`——NACK 发了一千多次，宿主一次都没补。
+
+**排查链（每一步都排除了一个假设）**：
+
+| 步骤 | 观测 | 结论 |
+|---|---|---|
+| 1. NACK 是否到达宿主 | `[rtcp] nack` 从 0 涨到 635+ | RTCP 读取路径正常 |
+| 2. SSRC 是否匹配 | 本端 `ssrc=2593604378` == NACK `media_ssrc: 2593604378` | 不是 SSRC 问题 |
+| 3. `bind_local_stream` 是否被调用 | 在 vendor 里加日志 → `bind ssrc=... nack_supported=false feedback=[]` | **根因命中** |
+
+**根因**：webrtc-rs 建 `StreamInfo` 时用的是 **track 自己的 codec**（`rtp_sender/mod.rs:480`），
+而不是 transceiver 协商出的那份。本项目给 `TrackLocalStaticSample` 传的 codec 里
+`rtcp_feedback: vec![]` 是空的 → `stream_support_nack()` 返回 false →
+`nack::Responder` **连重传缓存都不建** → 后续 NACK 查表 miss 后**静默 return**（无日志无报错）。
+注册给 `media_engine` 的那份（带 nack）只影响 SDP 协商，管不到这条路径。
+
+**修复分两层**：
+
+1. **补 track codec 的 `rtcp_feedback`**（`webrtc.rs`）→ 缓存能建起来了，日志变为
+   `nack_supported=true feedback=[("transport-cc",""), ("nack",""), ("nack","pli")]`；
+2. **重传必须走 RTX**（vendor `nack::Responder`）：原实现直接重发原包（原 SSRC / PT 102），
+   但 SDP 一旦协商了 RTX，浏览器只认 RTX 流上的重传，原 SSRC 的旧序号被当重复包丢弃
+   （A/B 实测：关掉 RTX 后重传仍为 0）。按 RFC 4588 改写为
+   **RTX SSRC + PT 96 + 独立递增序列号 + payload 前置 2 字节原序列号**。
+
+**实测结果（2026-11-21，Clumsy Drop 3% Outbound）**：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 重传（收到/发出 NACK） | 0 / 1564 | **498 / 263** |
+| 上屏 | 30fps | **30fps（稳定，无花屏）** |
+| 缓冲 | 24ms | 11~28ms |
+| 丢包（累计） | 0.0x%（Drop 未真正生效时） | 3.27% |
+
+「收到重传 > 发出 NACK」是正常的：一个 `TransportLayerNack` 可携带多个 nack pair（多个序号请求），
+因此一次 NACK 会触发多次包重传。
+
+> **口径提醒**：`packetsLost` 是累计值，补回的包一般不会从计数里回减，所以 3.27% 不下降
+> 不等于仍在丢。判断重传是否真有效请看 **「重传」计数是否增长 + 画面是否花屏**，而不是丢包率是否归零。
+
 ### P1.4.2 延迟与丢包注入
 
 | 项 | 内容 |
