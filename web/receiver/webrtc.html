@@ -188,6 +188,48 @@ let tStart = 0, firstFrameLogged = false;
 // 宿主侧从 stable 状态应用第二个 answer 非法，会直接判会话失败。
 let lastOfferSdp = '';
 
+// ---- 自动重连（P1.4.3）----
+// 断线后重建整条会话：关掉旧 PeerConnection 与 WS，宿主会在 WS 断开时销毁旧会话，
+// 然后重新走一遍信令。不做 ICE restart：宿主按 WS 连接 id 建会话，换一条干净连接最可靠。
+let reconnTimer = null;
+let reconnAttempts = 0;
+let reconnInFlight = false;
+let closingForReconnect = false;   // 主动关闭 WS 时不要触发"信令断开"重连
+let disconnectGrace = null;        // disconnected 的自愈观察窗口
+
+function scheduleReconnect(reason) {
+  if (!started || reconnInFlight) return;
+  if (reconnAttempts >= 20) {      // 宿主彻底不在了就别无限重试
+    renderState('failed');
+    L('❌ 重连失败次数过多，请刷新页面重新连接', 'bad');
+    return;
+  }
+  reconnInFlight = true;
+  reconnAttempts++;
+  const delay = Math.min(500 * Math.pow(2, reconnAttempts - 1), 3000);
+  renderState('reconnecting');
+  L('⚠️ ' + reason + '，' + delay + 'ms 后重连（第 ' + reconnAttempts + ' 次）');
+  clearTimeout(reconnTimer);
+  reconnTimer = setTimeout(doReconnect, delay);
+}
+
+function doReconnect() {
+  reconnTimer = null;
+  if (!started) { reconnInFlight = false; return; }
+  closingForReconnect = true;
+  try { if (pc) { pc.onconnectionstatechange = null; pc.close(); } } catch (_) {}
+  pc = null;
+  try { if (ws) { ws.onclose = null; ws.close(); } } catch (_) {}
+  ws = null;
+  closingForReconnect = false;
+  lastOfferSdp = '';
+  firstFrameLogged = false;        // 重连后重新统计首帧
+  try { video.srcObject = null; } catch (_) {}
+  reconnInFlight = false;          // 允许这次重连失败后再次调度
+  renderState('connecting');
+  connectSignaling();
+}
+
 
 function send(obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -242,10 +284,26 @@ function buildPeerConnection() {
     if (pc.connectionState === 'connected') {
       renderState('connected');
       L('✅ WebRTC 已连接', 'ok');
+      clearTimeout(disconnectGrace);
+      if (reconnAttempts > 0) L('✅ 重连成功（第 ' + reconnAttempts + ' 次）');
+      reconnAttempts = 0;
+      reconnInFlight = false;
     }
     if (pc.connectionState === 'connecting') renderState('connecting');
-    if (pc.connectionState === 'failed') { renderState('failed'); L('❌ 连接失败'); }
-    if (pc.connectionState === 'disconnected') { renderState('reconnecting'); L('⚠️ 连接断开，等待恢复'); }
+    if (pc.connectionState === 'failed') {
+      renderState('failed');
+      L('❌ 连接失败');
+      scheduleReconnect('连接失败');
+    }
+    if (pc.connectionState === 'disconnected') {
+      renderState('reconnecting');
+      L('⚠️ 连接断开，2 秒内未恢复将重连');
+      // ICE 抖动经常能自愈，先给 2 秒宽限；仍是 disconnected 才真正重建会话
+      clearTimeout(disconnectGrace);
+      disconnectGrace = setTimeout(() => {
+        if (pc && pc.connectionState !== 'connected') scheduleReconnect('连接未恢复');
+      }, 2000);
+    }
   };
   renderState('connecting');
   pc.ontrack = (e) => {
@@ -395,7 +453,11 @@ function connectSignaling() {
   ws = new WebSocket('ws://' + location.hostname + ':' + WS_PORT + '/');
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { el('ws').textContent = '已连接'; L('信令已连接，等待宿主 offer…'); };
-  ws.onclose = () => { el('ws').textContent = '已断开'; L('信令断开'); };
+  ws.onclose = () => {
+    el('ws').textContent = '已断开';
+    L('信令断开');
+    if (!closingForReconnect) scheduleReconnect('信令断开');
+  };
   ws.onerror = () => { el('ws').textContent = '错误'; L('信令错误'); };
   ws.onmessage = async (ev) => {
     let msg;
