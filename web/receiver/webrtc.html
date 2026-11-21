@@ -70,6 +70,7 @@
 <header>
   <h1>remote-screen · WebRTC</h1>
   <span id="state" class="pill">未连接</span>
+  <span class="stat">会话 <b id="sid">—</b></span>
   <span class="stat">信令 <b id="ws">未连接</b></span>
   <span class="stat">ICE <b id="ice">—</b></span>
   <span class="stat">连接 <b id="pc">—</b></span>
@@ -491,6 +492,8 @@ function connectSignaling() {
     catch (e) { return; }   // 二进制视频数据忽略
 
     if (msg.t === 'webrtc-offer') {
+      // 宿主在 offer 里带了自己的会话号，显示出来以便和宿主日志 `[ctl] #N` 对应
+      if (msg.cid) { el('sid').textContent = '#' + msg.cid; L('本会话 = #' + msg.cid); }
       if (msg.sdp === lastOfferSdp) { L('忽略重复 offer（同一份 SDP）'); return; }
       lastOfferSdp = msg.sdp;
       if (!pc) buildPeerConnection();

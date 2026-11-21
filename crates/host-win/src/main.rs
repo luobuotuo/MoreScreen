@@ -682,7 +682,9 @@ fn main() {
                                     let ok = hub_pump.send_to(
                                         id,
                                         &format!(
-                                            "{{\"t\":\"webrtc-offer\",\"sdp\":\"{}\"}}",
+                                            // cid 让接收端能显示自己对应宿主日志里的哪个会话号
+                                            "{{\"t\":\"webrtc-offer\",\"cid\":{},\"sdp\":\"{}\"}}",
+                                            id,
                                             json_escape(&sdp)
                                         ),
                                     );
