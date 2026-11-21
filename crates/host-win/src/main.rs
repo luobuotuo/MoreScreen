@@ -958,6 +958,9 @@ fn handle_ctl(client_id: u64, text: &str) {
             let loss = json_num(text, "loss").unwrap_or(0.0);
             let rtt = json_num(text, "rtt").unwrap_or(0.0);
             let jb = json_num(text, "jb").unwrap_or(0.0);
+            // 页面在后台时接收端解码被浏览器暂停，上报的 fps 是冻结值，
+            // 必须标注出来，否则会被误判成"链路掉到 2fps"。
+            let bg = json_num(text, "bg").unwrap_or(0.0) > 0.5;
             // 画质建议：丢包是主要判据（>3% 已经影响观感）
             let advice = if loss > 3.0 {
                 "建议降码率（丢包 >3%）"
@@ -966,8 +969,9 @@ fn handle_ctl(client_id: u64, text: &str) {
             } else {
                 "维持当前码率"
             };
+            let note = if bg { "（页面后台，帧率冻结）" } else { "" };
             println!(
-                "[ctl] #{client_id} 质量：上屏 {fps:.1}fps 丢包 {loss:.2}% RTT {rtt:.0}ms 缓冲 {jb:.0}ms → {advice}"
+                "[ctl] #{client_id} 质量：上屏 {fps:.1}fps{note} 丢包 {loss:.2}% RTT {rtt:.0}ms 缓冲 {jb:.0}ms → {advice}"
             );
         }
         "input" => {
