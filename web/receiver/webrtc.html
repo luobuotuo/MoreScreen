@@ -532,6 +532,11 @@ function buildPeerConnection() {
   }
 
   function startE2eProbe() {
+    // ?noe2e=1 关闭探针采样：A/B 验证 canvas 读帧是否拖累华为平板上屏帧率
+    if (location.search.indexOf('noe2e') >= 0) {
+      L('e2e 探针已按 ?noe2e 关闭（A/B 对比用）');
+      return;
+    }
     if (!video.requestVideoFrameCallback) { e2eUnsupported = true; return; }
     if (!e2eCanvas) {
       e2eCanvas = document.createElement('canvas');
@@ -540,6 +545,7 @@ function buildPeerConnection() {
       e2eCtx = e2eCanvas.getContext('2d', { willReadFrequently: true });
     }
     let skip = 0;
+    let lastDiag = 0;
     const onFrame = (now, meta) => {
       // 每 6 帧读一次（6Hz 足够统计 p50/p95，且 getImageData 不拖累上屏）
       if (skip++ % 6 === 0 && clockOffset !== null) {
@@ -549,13 +555,25 @@ function buildPeerConnection() {
           // 上屏时刻优先用 expectedDisplayTime（合成器预期显示时刻，比
           // rVFC 回调时刻更接近真实玻璃时刻）
           const showAt = (meta && meta.expectedDisplayTime) || now;
-          let d = (showAt - (tSend + clockOffset)) % E2E_MOD;
+          // clockOffset = 宿主时间 - 本地时间（hs - c - rtt/2），
+          // 因此本地时刻换算到宿主时间轴是 showAt + offset（2026-11-22 修正：
+          // 原实现写成 showAt - offset，差 2×offset → d 取模后随机落窗口外）。
+          let d = (showAt + clockOffset - tSend) % E2E_MOD;
           if (d < 0) d += E2E_MOD;
           // 有效窗口 3~800ms；探针未开/色块被光标遮挡 → 落到窗口外被丢弃
           if (d >= 3 && d <= 800) {
             e2eSamples.push(d);
             if (e2eSamples.length > 240) e2eSamples.shift();
+          } else if (now - lastDiag > 2000) {
+            lastDiag = now;
+            L('[e2e] 时间戳有效但延迟超窗口：d=' + d.toFixed(0)
+              + 'ms（offset=' + clockOffset.toFixed(0) + '）', 'warn');
           }
+        } else if (now - lastDiag > 2000) {
+          // 读不到探针标志位：多半是 canvas 取到黑帧（鸿蒙浏览器 video→canvas 兼容性）
+          lastDiag = now;
+          L('[e2e] 读不到探针标志：v=0x' + (v === null ? 'null' : v.toString(16))
+            + '（v=null 表示 drawImage 失败；v=0 表示取到黑帧）', 'warn');
         }
       }
       if (video.srcObject) video.requestVideoFrameCallback(onFrame);
@@ -582,7 +600,8 @@ function buildPeerConnection() {
     } else if (clockOffset === null) {
       e.textContent = '同步中';
     } else {
-      e.textContent = '未开启';
+      // clockOffset 正常但无样本：区分「色块读不到」与「宿主没开探针」
+      e.textContent = '无信号';
     }
   }
 
