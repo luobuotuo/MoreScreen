@@ -253,12 +253,37 @@ impl Default for CursorPainter {
 }
 
 impl CursorPainter {
-    /// 把当前光标画到 `clean`（不含光标的 BGRA 帧）上。
-    ///
-    /// 返回 `Some(painted)`：光标可见且落在采集区域内，`painted` 是写入
-    /// `scratch` 的合成帧；返回 `None`：光标不可见/不在区域，直接用 `clean`。
-    ///
-    /// `origin` = 采集区域在虚拟屏坐标系的原点（物理像素）。
+    /// 定位光标：返回光标位图左上角在图上的坐标。
+    /// 光标不可见 / 解码失败 / 完全在区域外 → None。
+    fn locate(&mut self, w: usize, h: usize, origin_x: i32, origin_y: i32) -> Option<(i32, i32)> {
+        let (handle, pos) = current_cursor()?;
+        if handle != self.handle {
+            unsafe { self.decoded = decode(handle) };
+            self.handle = handle; // 解码失败也记住句柄，避免每帧重试 GDI
+        }
+        let d = self.decoded.as_ref()?;
+        let dx = pos.x - origin_x - d.hotspot.0;
+        let dy = pos.y - origin_y - d.hotspot.1;
+        if dx + d.w <= 0 || dy + d.h <= 0 || dx >= w as i32 || dy >= h as i32 {
+            return None; // 完全在区域外：调用方零拷贝直接发干净帧
+        }
+        Some((dx, dy))
+    }
+
+    /// 把当前光标直接画到 `buf`（调用方已先拷入干净帧内容）。返回是否画了。
+    /// 与 `render` 的区别：不做拷贝，供“光标 + 延迟探针”共用一个合成缓冲时使用。
+    pub fn blit(&mut self, buf: &mut [u8], w: usize, h: usize, origin_x: i32, origin_y: i32) -> bool {
+        let Some((dx, dy)) = self.locate(w, h, origin_x, origin_y) else {
+            return false;
+        };
+        let Some(d) = self.decoded.as_ref() else {
+            return false;
+        };
+        draw(d, buf, w, h, dx, dy);
+        true
+    }
+
+    /// 合成到副本：内部判断光标是否落在区域内，**不在区域内不做整帧拷贝**。
     pub fn render<'a>(
         &mut self,
         scratch: &'a mut Vec<u8>,
@@ -268,66 +293,53 @@ impl CursorPainter {
         origin_x: i32,
         origin_y: i32,
     ) -> Option<&'a [u8]> {
-        let (handle, pos) = current_cursor()?;
-        if handle != self.handle {
-            unsafe { self.decoded = decode(handle) };
-            self.handle = handle;
-            // 解码失败也要记住句柄，避免每帧重试 GDI 调用。
-        }
-        let d = self.decoded.as_ref()?;
-
-        // 光标位图左上角（屏幕坐标 → 区域局部 → 减热点）。
-        let dx = pos.x - origin_x - d.hotspot.0;
-        let dy = pos.y - origin_y - d.hotspot.1;
-        let dw = d.w;
-        let dh = d.h;
-        // 完全在区域外 → 无需合成（也避免无意义的整帧拷贝）。
-        if dx + dw <= 0 || dy + dh <= 0 || dx >= w as i32 || dy >= h as i32 {
-            return None;
-        }
-
+        self.locate(w, h, origin_x, origin_y)?;
         if scratch.len() != clean.len() {
             scratch.clear();
             scratch.resize(clean.len(), 0);
         }
         scratch.copy_from_slice(clean);
+        self.blit(&mut scratch[..], w, h, origin_x, origin_y);
+        Some(&scratch[..])
+    }
+}
 
-        for cy in 0..dh {
-            for cx in 0..dw {
-                let o = (cy as usize * d.w as usize + cx as usize) * 4;
-                let a = d.pixels[o + 3];
-                if a == A_TRANSPARENT {
-                    continue;
+/// 绘制循环：按 alpha 约定把光标像素混合到目标缓冲。
+fn draw(d: &DecodedCursor, buf: &mut [u8], w: usize, h: usize, dx: i32, dy: i32) {
+    for cy in 0..d.h {
+        for cx in 0..d.w {
+            let o = (cy as usize * d.w as usize + cx as usize) * 4;
+            let a = d.pixels[o + 3];
+            if a == A_TRANSPARENT {
+                continue;
+            }
+            let tx = dx + cx;
+            let ty = dy + cy;
+            if tx < 0 || ty < 0 || tx >= w as i32 || ty >= h as i32 {
+                continue; // 部分越界裁剪
+            }
+            let di = (ty as usize * w + tx as usize) * 4;
+            match a {
+                A_OPAQUE => {
+                    buf[di] = d.pixels[o];
+                    buf[di + 1] = d.pixels[o + 1];
+                    buf[di + 2] = d.pixels[o + 2];
                 }
-                let tx = dx + cx;
-                let ty = dy + cy;
-                if tx < 0 || ty < 0 || tx >= w as i32 || ty >= h as i32 {
-                    continue; // 部分越界裁剪
+                A_INVERT => {
+                    buf[di] = !buf[di];
+                    buf[di + 1] = !buf[di + 1];
+                    buf[di + 2] = !buf[di + 2];
                 }
-                let di = (ty as usize * w + tx as usize) * 4;
-                match a {
-                    A_OPAQUE => {
-                        scratch[di] = d.pixels[o];
-                        scratch[di + 1] = d.pixels[o + 1];
-                        scratch[di + 2] = d.pixels[o + 2];
-                    }
-                    A_INVERT => {
-                        scratch[di] = !scratch[di];
-                        scratch[di + 1] = !scratch[di + 1];
-                        scratch[di + 2] = !scratch[di + 2];
-                    }
-                    a => {
-                        // 带真实 alpha 的 source-over（彩色光标半透明边缘）。
-                        let inv = 255 - a;
-                        for c in 0..3 {
-                            let src = d.pixels[o + c] as u32 * a as u32;
-                            let dst = scratch[di + c] as u32 * inv as u32;
-                            scratch[di + c] = ((src + dst) / 255) as u8;
-                        }
+                a => {
+                    // 带真实 alpha 的 source-over（彩色光标半透明边缘）。
+                    let inv = 255 - a;
+                    for c in 0..3 {
+                        let src = d.pixels[o + c] as u32 * a as u32;
+                        let dst = buf[di + c] as u32 * inv as u32;
+                        buf[di + c] = ((src + dst) / 255) as u8;
                     }
                 }
             }
         }
-        Some(&scratch[..])
     }
 }

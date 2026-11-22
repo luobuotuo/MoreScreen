@@ -333,7 +333,8 @@ fn main() {
                     target.mode.height,
                     seconds * 1000,
                     cfg.fps,
-                    true, // 旧 WS 路径固定包含光标
+                    true,  // 旧 WS 路径固定包含光标
+                    false, // 旧 WS 路径不启用延迟探针
                     |bgra| {
                         let t_capture = t_origin.elapsed().as_nanos() as u64;
                         let queued = enc2.push_frame(bgra)?;
@@ -600,6 +601,9 @@ fn main() {
             // 是否把鼠标光标合成进画面（WGC 默认 true）。
             // 某些虚拟显示器上光标位置会抖动，用 `--no-cursor` 可对照排查。
             let include_cursor = !args.iter().any(|a| a == "--no-cursor");
+            // 端到端延迟探针：在画面左上角叠 16 位时间戳色块，供接收端读回。
+            // 默认关（会遮挡画面左上角），仅在测「玻璃到玻璃延迟」时开启。
+            let latency_probe = args.iter().any(|a| a == "--latency-probe");
             println!(
                 "光标合成    : {}",
                 if include_cursor {
@@ -608,6 +612,9 @@ fn main() {
                     "关闭（--no-cursor）"
                 }
             );
+            if latency_probe {
+                println!("延迟探针    : 开启（左上角 16 色块，接收端可读玻璃到玻璃延迟）");
+            }
 
             let cfg = remote_screen_host_win::encode::EncodeConfig {
                 width: target.mode.width.max(16),
@@ -727,6 +734,20 @@ fn main() {
                                             SignalIn::Ctl("{\"t\":\"echo-ok\"}".into()),
                                         );
                                     }
+                                    // 时钟同步（端到端延迟）：回带宿主单调毫秒 hs，
+                                    // 接收端用往返最小 RTT 样本估算两端时钟偏移。
+                                    if json_str(&text, "t").as_deref() == Some("sync") {
+                                        let c = json_str(&text, "c")
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| "0".into());
+                                        rtc.deliver(
+                                            id,
+                                            SignalIn::Ctl(format!(
+                                                "{{\"t\":\"sync-ok\",\"c\":{c},\"hs\":{}}}",
+                                                remote_screen_host_win::latency_probe::host_ms()
+                                            )),
+                                        );
+                                    }
                                     handle_ctl(id, &text);
                                 }
                             }
@@ -754,6 +775,7 @@ fn main() {
                 seconds * 1000,
                 fps,
                 include_cursor,
+                latency_probe,
                 |bgra| {
                     let queued = enc2.push_frame(bgra)?;
                     if !queued {
@@ -864,7 +886,7 @@ fn main() {
             }
         }
         _ => {
-            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--display SUBSTR] | capture-diag [--display SUBSTR] [--seconds N] [--fps N] [--out FILE] | capture-dump | stream [--index N] [--display SUBSTR] [--port P] [--seconds S] [--fps N] [--bitrate K] [--nv12 file] | stream-webrtc [--display SUBSTR] [--mode WxH[@Hz]] [--fps N] [--bitrate K] [--seconds S] [--no-cursor] [--allow-input] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
+            println!("用法: rs-host <displays [--json] | modes --index N | selftest | capture-probe [--display SUBSTR] | capture-diag [--display SUBSTR] [--seconds N] [--fps N] [--out FILE] | capture-dump | stream [--index N] [--display SUBSTR] [--port P] [--seconds S] [--fps N] [--bitrate K] [--nv12 file] | stream-webrtc [--display SUBSTR] [--mode WxH[@Hz]] [--fps N] [--bitrate K] [--seconds S] [--no-cursor] [--latency-probe] [--allow-input] | vdd-install [--inf PATH] [--hw Root\\MttVDD]>");
         }
     }
 }

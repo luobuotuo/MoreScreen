@@ -83,6 +83,7 @@
   <span class="stat">重传 <b id="retx">—</b></span>
   <span class="stat">RTT <b id="rtt">—</b></span>
   <span class="stat">缓冲 <b id="jb">—</b></span>
+  <span class="stat">玻璃到玻璃 <b id="e2e">—</b></span>
   <span class="stat">控制通道 <b id="dcstat">—</b></span>
 </header>
 
@@ -357,6 +358,7 @@ function buildPeerConnection() {
       // 通道回环自检：测 SCTP 双向连通，与 SendInput 是否被拒完全解耦
       echoSentAt = performance.now();
       ctlSend({ t: 'echo' });
+      startClockSync();   // 端到端延迟测量：估算两端时钟偏移
     };
     ch.onopen = onOpen;
     // 竞态兜底：若 ondatachannel 事件派发晚于 SCTP 流 open，onopen 事件已错过，
@@ -375,6 +377,11 @@ function buildPeerConnection() {
         el('dcstat').textContent = 'open·' + ms + 'ms';
         L('控制通道回环 ' + ms + ' ms：双向连通正常');
         echoSentAt = 0;
+        return;
+      }
+      // 时钟同步回包（端到端延迟）：用最小 RTT 样本估算两端偏移
+      if (typeof d === 'string' && d.indexOf('sync-ok') >= 0) {
+        try { onSyncOk(JSON.parse(d)); } catch (_) {}
         return;
       }
       // 宿主下发的状态（例如输入是否已启用）
@@ -452,7 +459,127 @@ function buildPeerConnection() {
     } else {
       L('此内核不支持 requestVideoFrameCallback');
     }
+    startE2eProbe();   // 端到端延迟探针读帧循环（宿主未开探针时自动显示「未开启」）
   };
+
+  // ---- 端到端（玻璃到玻璃）延迟探针 ----
+  // 宿主 --latency-probe 时在画面左上角叠 16 个黑白方块：
+  // bit15 恒 1 = 探针标志；bit0..14 = host_ms mod 32768。
+  // 这里用 requestVideoFrameCallback + canvas 读回时间戳，配合 DataChannel
+  // 往返（sync / sync-ok，取最小 RTT 样本）估算两端时钟偏移，得到：
+  //   玻璃到玻璃延迟 = 上屏时刻 - 宿主发送时刻 - 时钟偏移
+  // 未开启探针时读不到标志位，显示「未开启」，不会被画面内容误导。
+  const E2E_BLOCK = 32, E2E_GAP = 8, E2E_BITS = 16, E2E_W = 640, E2E_H = 32;
+  const E2E_MOD = 32768, E2E_FLAG = 0x8000;
+  let e2eCanvas = null, e2eCtx = null;
+  let clockOffset = null;        // host_ms - local performance.now 偏移
+  let bestSyncRtt = Infinity;    // 最小 RTT 样本（offset 误差 ±rtt/2）
+  let e2eSamples = [];           // 最近 240 个延迟样本（ms）
+  let e2eUnsupported = false;
+
+  function startClockSync() {
+    // 连上就重置：5 次往返，取最小 RTT 的那次算偏移（排队抖动最小）。
+    clockOffset = null;
+    bestSyncRtt = Infinity;
+    e2eSamples = [];
+    let n = 0;
+    const tick = () => {
+      if (!dc || dc.readyState !== 'open' || n >= 5) return;
+      n++;
+      ctlSend({ t: 'sync', c: Math.round(performance.now()) });
+      setTimeout(tick, 120);
+    };
+    tick();
+  }
+
+  function onSyncOk(msg) {
+    const c = Number(msg.c), hs = Number(msg.hs);
+    if (!isFinite(c) || !isFinite(hs)) return;
+    const rtt = performance.now() - c;
+    if (rtt < 0 || rtt > 2000) return;
+    if (rtt <= bestSyncRtt) {
+      bestSyncRtt = rtt;
+      clockOffset = hs - (c + rtt / 2);
+    }
+  }
+
+  function readE2eBits() {
+    if (!e2eCtx || !video.videoWidth) return null;
+    try {
+      e2eCtx.drawImage(video, 0, 0, E2E_W, E2E_H, 0, 0, E2E_W, E2E_H);
+    } catch (_) { return null; }
+    const img = e2eCtx.getImageData(0, 0, E2E_W, E2E_H).data;
+    let v = 0;
+    for (let i = 0; i < E2E_BITS; i++) {
+      const bx = i * (E2E_BLOCK + E2E_GAP) + E2E_BLOCK / 2;
+      const by = E2E_BLOCK / 2;
+      let sum = 0;
+      // 块中心 8×8 平均亮度：抗 H.264 边缘模糊
+      for (let dy = -4; dy < 4; dy++) {
+        for (let dx = -4; dx < 4; dx++) {
+          const o = ((by + dy) * E2E_W + (bx + dx)) * 4;
+          sum += (img[o] + img[o + 1] + img[o + 2]) / 3;
+        }
+      }
+      if (sum / 64 > 128) v |= (1 << i);
+    }
+    return v;
+  }
+
+  function startE2eProbe() {
+    if (!video.requestVideoFrameCallback) { e2eUnsupported = true; return; }
+    if (!e2eCanvas) {
+      e2eCanvas = document.createElement('canvas');
+      e2eCanvas.width = E2E_W;
+      e2eCanvas.height = E2E_H;
+      e2eCtx = e2eCanvas.getContext('2d', { willReadFrequently: true });
+    }
+    let skip = 0;
+    const onFrame = (now, meta) => {
+      // 每 6 帧读一次（6Hz 足够统计 p50/p95，且 getImageData 不拖累上屏）
+      if (skip++ % 6 === 0 && clockOffset !== null) {
+        const v = readE2eBits();
+        if (v !== null && (v & E2E_FLAG)) {
+          const tSend = v & (E2E_MOD - 1);
+          // 上屏时刻优先用 expectedDisplayTime（合成器预期显示时刻，比
+          // rVFC 回调时刻更接近真实玻璃时刻）
+          const showAt = (meta && meta.expectedDisplayTime) || now;
+          let d = (showAt - (tSend + clockOffset)) % E2E_MOD;
+          if (d < 0) d += E2E_MOD;
+          // 有效窗口 3~800ms；探针未开/色块被光标遮挡 → 落到窗口外被丢弃
+          if (d >= 3 && d <= 800) {
+            e2eSamples.push(d);
+            if (e2eSamples.length > 240) e2eSamples.shift();
+          }
+        }
+      }
+      if (video.srcObject) video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+  }
+
+  function e2ePercentile(p) {
+    if (!e2eSamples.length) return null;
+    const a = e2eSamples.slice().sort((x, y) => x - y);
+    return a[Math.min(a.length - 1, Math.floor(a.length * p))];
+  }
+
+  function updateE2eDisplay() {
+    const e = el('e2e');
+    if (!e) return;
+    const p50 = e2ePercentile(0.5), p95 = e2ePercentile(0.95);
+    if (p50 !== null) {
+      e.textContent = p50.toFixed(0) + ' / ' + p95.toFixed(0) + ' ms';
+      e.title = 'p50 / p95（样本 ' + e2eSamples.length + '，时钟偏移误差 ±'
+        + (bestSyncRtt === Infinity ? '?' : (bestSyncRtt / 2).toFixed(1)) + 'ms）';
+    } else if (e2eUnsupported) {
+      e.textContent = '不支持';
+    } else if (clockOffset === null) {
+      e.textContent = '同步中';
+    } else {
+      e.textContent = '未开启';
+    }
+  }
 
   // 每秒采样一次：对外只给瞬时值（差分），累计值对判断卡顿没有意义
   let prev = null;
@@ -507,6 +634,8 @@ function buildPeerConnection() {
       lastJb = jbDelay * 1000 / jbCount;
       el('jb').textContent = lastJb.toFixed(0) + ' ms';
     }
+    // 玻璃到玻璃延迟（需宿主 --latency-probe；未开启显示「未开启」）
+    updateE2eDisplay();
 
     // ---- 高延迟看门狗 ----
     // 弱网雪崩后，浏览器 jitterBuffer 只会渐进收缩：实测从 3.5s 回落到 126ms 要 5 分钟。

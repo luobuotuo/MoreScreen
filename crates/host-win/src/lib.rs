@@ -5,6 +5,7 @@ pub mod cursor;
 pub mod displays;
 pub mod encode;
 pub mod input;
+pub mod latency_probe;
 pub mod readback;
 pub mod serve;
 pub mod vdd;

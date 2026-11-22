@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::cursor::CursorPainter;
+use crate::latency_probe;
 use crate::readback::{analyze_surface, read_surface_bgra, FrameContent};
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
@@ -320,6 +321,7 @@ pub fn capture_stream<F>(
     duration_ms: u64,
     target_fps: u32,
     include_cursor: bool,
+    latency_probe: bool,
     mut on_frame: F,
 ) -> Result<CaptureStats, String>
 where
@@ -434,7 +436,31 @@ where
                         last_push = Some(now);
                         // 干净帧（无光标）缓存供保活重画；发送前一刻合成
                         // 光标 → 光标位置与帧内容时间差最小（拖动不漂移）。
-                        let send: &[u8] = if include_cursor {
+                        // 探针色块只能画在“本次发送的副本”上，绝不能进干净帧缓存，
+                        // 否则保活帧会带旧时间戳反复发送，延迟读数虚高。
+                        let send: &[u8] = if latency_probe {
+                            if cursor_scratch.len() != bgra.len() {
+                                cursor_scratch.clear();
+                                cursor_scratch.resize(bgra.len(), 0);
+                            }
+                            cursor_scratch.copy_from_slice(&bgra);
+                            if include_cursor {
+                                cursor_painter.blit(
+                                    &mut cursor_scratch,
+                                    width as usize,
+                                    height as usize,
+                                    bounds_x,
+                                    bounds_y,
+                                );
+                            }
+                            latency_probe::stamp(
+                                &mut cursor_scratch,
+                                width as usize,
+                                height as usize,
+                                latency_probe::host_ms(),
+                            );
+                            &cursor_scratch[..]
+                        } else if include_cursor {
                             match cursor_painter.render(
                                 &mut cursor_scratch,
                                 &bgra,
@@ -464,7 +490,31 @@ where
                     // 依然 30fps 流畅移动（WGC 系统合成做不到这一点）。
                     if let (Some(buf), Some(lp)) = (&last_bgra, last_push) {
                         if lp.elapsed() >= keepalive_interval {
-                            let send: &[u8] = if include_cursor {
+                            // 保活帧同样按当前位置重画光标 / 重新打探针时间戳
+                            // （时间戳必须是“现在”，不能是上一帧的）。
+                            let send: &[u8] = if latency_probe {
+                                if cursor_scratch.len() != buf.len() {
+                                    cursor_scratch.clear();
+                                    cursor_scratch.resize(buf.len(), 0);
+                                }
+                                cursor_scratch.copy_from_slice(buf);
+                                if include_cursor {
+                                    cursor_painter.blit(
+                                        &mut cursor_scratch,
+                                        width as usize,
+                                        height as usize,
+                                        bounds_x,
+                                        bounds_y,
+                                    );
+                                }
+                                latency_probe::stamp(
+                                    &mut cursor_scratch,
+                                    width as usize,
+                                    height as usize,
+                                    latency_probe::host_ms(),
+                                );
+                                &cursor_scratch[..]
+                            } else if include_cursor {
                                 match cursor_painter.render(
                                     &mut cursor_scratch,
                                     buf,
