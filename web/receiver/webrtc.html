@@ -189,8 +189,12 @@ function flushCtlQueue() {
 /// 统一复位控制态：新建 PC / 重连 / 通道关闭时都调用。
 /// 不清 dc 的话，重连后 dc 仍指向旧通道，输入会继续发进黑洞。
 function resetControlUI() {
-  // 保存重连前的控制状态：通道恢复后自动接续（页面刷新不保留——安全边界）
-  wasControlling = inputOn;
+  // 保存重连前的控制状态：通道恢复后自动接续（页面刷新不保留——安全边界）。
+  // 只置位、不清零：resetControlUI 在一次重连里会被连续调用多次
+  //（onclose → doReconnect → buildPeerConnection 各一次），第一次已把
+  // inputOn 清掉，覆盖式保存会让第二次把记忆抹成 false → 自动恢复失效
+  //（2026-11-23 修复：实测重连后按钮回到「控制本机」）。
+  if (inputOn) wasControlling = true;
   const d = el('dcstat');
   if (d) d.textContent = '连接中';
   dc = null;
