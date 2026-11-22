@@ -122,6 +122,7 @@ const video = el('v');
 // ---- P2 交互层全局状态 ----
 let dc = null;              // 控制 DataChannel（宿主创建，名 ctl）
 let inputOn = false;        // 输入回传开关（默认关，避免误操作主机）
+let wasControlling = false; // 重连前是否处于控制模式（重连后自动恢复用）
 let lastMoveSent = 0;       // 鼠标移动节流时间戳（毫秒）
 // ---- 控制通道就绪状态（2026-11-21 实测修复）----
 // 症状：连接早期点击主机完全无响应（宿主物理屏也不动），几十秒后才生效。
@@ -188,6 +189,8 @@ function flushCtlQueue() {
 /// 统一复位控制态：新建 PC / 重连 / 通道关闭时都调用。
 /// 不清 dc 的话，重连后 dc 仍指向旧通道，输入会继续发进黑洞。
 function resetControlUI() {
+  // 保存重连前的控制状态：通道恢复后自动接续（页面刷新不保留——安全边界）
+  wasControlling = inputOn;
   const d = el('dcstat');
   if (d) d.textContent = '连接中';
   dc = null;
@@ -353,7 +356,19 @@ function buildPeerConnection() {
       L('控制通道已就绪（开始接收后 ' + secs + 's）');
       el('dcstat').textContent = 'open';
       const b = el('ctlbtn');
-      if (b) { b.disabled = false; b.textContent = '控制本机'; }
+      if (b) { b.disabled = false; b.textContent = '控制本机'; b.classList.remove('on'); }
+      // 重连自动恢复控制模式（2026-11-22 修复）：弱网抖动触发重连时
+      // resetControlUI 会把 inputOn 安全重置；若重连前用户开着控制，
+      // 通道就绪后自动接续。否则每次网络抖动都要手动重开，用户会误判为
+      // 「点击大面积失效」（实测踩坑：Clumsy 挂载瞬断 → 重连 → 控制被静默
+      // 关闭 → 之后所有点击不发送）。页面刷新不保留该状态，安全边界不变。
+      if (wasControlling) {
+        wasControlling = false;
+        inputOn = true;
+        if (b) { b.textContent = '停止控制'; b.classList.add('on'); }
+        video.classList.add('controlling');
+        L('✓ 已自动恢复控制模式（重连前处于开启状态）');
+      }
       flushCtlQueue();
       sendDeviceInfo();
       // 通道回环自检：测 SCTP 双向连通，与 SendInput 是否被拒完全解耦
@@ -931,6 +946,7 @@ el('ctlbtn').addEventListener('click', () => {
     return;
   }
   inputOn = !inputOn;
+  wasControlling = inputOn;   // 主动关闭后重连不再自动恢复
   el('ctlbtn').textContent = inputOn ? '停止控制' : '控制本机';
   el('ctlbtn').classList.toggle('on', inputOn);
   // 控制时禁止浏览器手势接管触摸，否则拖动会被 pointercancel 掐断
