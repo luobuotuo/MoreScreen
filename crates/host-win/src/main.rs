@@ -737,8 +737,13 @@ fn main() {
                                     // 时钟同步（端到端延迟）：回带宿主单调毫秒 hs，
                                     // 接收端用往返最小 RTT 样本估算两端时钟偏移。
                                     if json_str(&text, "t").as_deref() == Some("sync") {
-                                        let c = json_str(&text, "c")
-                                            .filter(|s| !s.is_empty())
+                                        // 数字（JSON number）与字符串（"123"）两种写法都支持
+                                        let c = json_num(&text, "c")
+                                            .map(|v| (v as u64).to_string())
+                                            .or_else(|| {
+                                                json_str(&text, "c")
+                                                    .filter(|s| !s.is_empty())
+                                            })
                                             .unwrap_or_else(|| "0".into());
                                         rtc.deliver(
                                             id,

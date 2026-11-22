@@ -347,6 +347,7 @@ function buildPeerConnection() {
     el('dcstat').textContent = ch.readyState === 'open' ? 'open' : '握手…';
     const onOpen = () => {
       if (dc !== ch) return;           // 旧通道迟到事件不得覆盖新会话
+      if (dcOpenAt) return;            // 幂等：onopen 与 readyState 兜底可能都触发
       dcOpenAt = performance.now();
       const secs = tStart ? ((dcOpenAt - tStart) / 1000).toFixed(1) : '?';
       L('控制通道已就绪（开始接收后 ' + secs + 's）');
@@ -358,6 +359,7 @@ function buildPeerConnection() {
       // 通道回环自检：测 SCTP 双向连通，与 SendInput 是否被拒完全解耦
       echoSentAt = performance.now();
       ctlSend({ t: 'echo' });
+      e2eSamples = [];    // 新会话：旧样本作废
       startClockSync();   // 端到端延迟测量：估算两端时钟偏移
     };
     ch.onopen = onOpen;
@@ -476,17 +478,19 @@ function buildPeerConnection() {
   let bestSyncRtt = Infinity;    // 最小 RTT 样本（offset 误差 ±rtt/2）
   let e2eSamples = [];           // 最近 240 个延迟样本（ms）
   let e2eUnsupported = false;
+  let syncOkAt = 0;              // 最后一次 sync 成功时刻（用于 60 秒刷新）
+  let syncNextAt = 0;            // 下次允许发起 sync 的时刻
 
   function startClockSync() {
-    // 连上就重置：5 次往返，取最小 RTT 的那次算偏移（排队抖动最小）。
-    clockOffset = null;
+    // 5 次往返，取最小 RTT 的那次算偏移（排队抖动最小）。
+    // 不清 e2eSamples：60 秒例行刷新时保留已有样本。
     bestSyncRtt = Infinity;
-    e2eSamples = [];
     let n = 0;
     const tick = () => {
       if (!dc || dc.readyState !== 'open' || n >= 5) return;
       n++;
-      ctlSend({ t: 'sync', c: Math.round(performance.now()) });
+      // c 用字符串发送：宿主 json_str 与 json_num 都能取到（双保险）
+      ctlSend({ t: 'sync', c: String(Math.round(performance.now())) });
       setTimeout(tick, 120);
     };
     tick();
@@ -500,6 +504,7 @@ function buildPeerConnection() {
     if (rtt <= bestSyncRtt) {
       bestSyncRtt = rtt;
       clockOffset = hs - (c + rtt / 2);
+      syncOkAt = Date.now();
     }
   }
 
@@ -633,6 +638,17 @@ function buildPeerConnection() {
     if (jbCount > 0) {
       lastJb = jbDelay * 1000 / jbCount;
       el('jb').textContent = lastJb.toFixed(0) + ' ms';
+    }
+    // 时钟同步补试/刷新：弱网下首轮 5 次可能全丢；成功后每 60 秒刷新一次
+    // （RTT 变化时保持 offset 精度）。
+    if (dc && dc.readyState === 'open' && Date.now() >= syncNextAt) {
+      if (clockOffset === null) {
+        syncNextAt = Date.now() + 5000;   // 未成功：5 秒后重试
+        startClockSync();
+      } else if (!syncOkAt || Date.now() - syncOkAt > 60000) {
+        syncNextAt = Date.now() + 60000;  // 成功：60 秒刷新
+        startClockSync();
+      }
     }
     // 玻璃到玻璃延迟（需宿主 --latency-probe；未开启显示「未开启」）
     updateE2eDisplay();
