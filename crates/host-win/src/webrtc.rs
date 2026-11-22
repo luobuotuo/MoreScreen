@@ -39,7 +39,6 @@ use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -525,22 +524,15 @@ async fn run_once(
     // 数据通道 `ctl`：承载输入回传、设备信息与网络质量上报。
     // 必须在这里创建（否则 ICE gathering 不会被触发，见下方注释）。
     //
-    // **不可靠无序 + 500ms 生命期**（2026-11-22 弱网实测修复）：
-    // 默认 ordered+reliable 在丢包时产生队头阻塞——一条消息丢包重传期间，
-    // 后续所有消息（包括点击）全部排队，弱网 RTT 220ms 一次丢包即让输入
-    // 延迟秒级，表现为「弱网下点击不起作用」（宿主直点有效、通道送达晚）。
-    // 输入是「最新状态优先」型流量：
-    //   - unordered：不等待补齐顺序，先到先用（每条消息 JSON 自包含，乱序无影响）；
-    //   - maxPacketLifeTime=500ms：丢包有一次重传机会（220ms RTT 内完成），
-    //     持续拥塞时超时丢弃，保住后续新消息不被旧消息阻塞。
-    // stat（3 秒周期）/echo/sync（自带重试）对偶发丢弃天然免疫。
-    let dc_init = RTCDataChannelInit {
-        ordered: Some(false),
-        max_packet_life_time: Some(500),
-        ..Default::default()
-    };
+    // **回退到默认 ordered+reliable（2026-11-22 深夜回归修复）**：
+    // 当晚曾改为 unordered+maxPacketLifeTime=500ms 治弱网队头阻塞，但实测
+    // 一进丢包环境 webrtc-rs 的 SCTP 就抛 `failed to handle_inbound: ErrChunk`
+    // （FORWARD-TSN 路径的兼容性缺陷），导致会话风暴——41 分钟 12 次崩溃
+    // 重连，比它要治的「点击迟到」严重得多。恢复昨晚 A2/A3 弱网验证过的
+    // 稳定配置；队头阻塞问题改由前端的就绪守卫 + 重连自动恢复控制模式
+    // （均已落地）缓解，等 webrtc-rs/浏览器兼容性查明后再评估 unordered-only。
     let ctl = pc
-        .create_data_channel("ctl", Some(dc_init))
+        .create_data_channel("ctl", None)
         .await
         .map_err(|e| format!("create_data_channel 失败: {e}"))?;
     {
