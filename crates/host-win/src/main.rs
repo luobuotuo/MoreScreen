@@ -601,8 +601,12 @@ fn main() {
             // 某些虚拟显示器上光标位置会抖动，用 `--no-cursor` 可对照排查。
             let include_cursor = !args.iter().any(|a| a == "--no-cursor");
             println!(
-                "光标捕获    : {}",
-                if include_cursor { "开启（默认）" } else { "关闭（--no-cursor）" }
+                "光标合成    : {}",
+                if include_cursor {
+                    "开启（自绘：发送时刻合成，静止保活重画）"
+                } else {
+                    "关闭（--no-cursor）"
+                }
             );
 
             let cfg = remote_screen_host_win::encode::EncodeConfig {

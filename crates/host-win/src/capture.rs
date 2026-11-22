@@ -13,6 +13,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::cursor::CursorPainter;
 use crate::readback::{analyze_surface, read_surface_bgra, FrameContent};
 use windows::core::{factory, Interface};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
@@ -347,11 +348,14 @@ where
         let session = pool
             .CreateCaptureSession(&item)
             .map_err(|e| format!("创建 GraphicsCaptureSession 失败: {e}"))?;
-        // 是否把鼠标光标合成进画面（WGC 默认 true）。
-        // 光标是独立图层，在帧捕获瞬间合成；虚拟显示器上可能出现位置抖动，
-        // 用 `--no-cursor` 关闭可做对照排查。老系统不支持该方法时忽略。
-        if let Err(e) = session.SetIsCursorCaptureEnabled(include_cursor) {
-            eprintln!("[capture] 设置光标捕获失败（忽略）: {e}");
+        // 光标合成走**自绘**（crate::cursor），WGC 自带合成恒关：
+        // ① 系统在帧捕获瞬间合成光标，采样时刻与帧内容不对齐，运动时
+        //   光标相对窗口漂移（接收端观感“晃动”）；
+        // ② 系统合成帧与静止保活冲突：保活复用上一帧会把光标冻结在旧位置；
+        // ③ 虚拟显示器上系统合成的光标位置有抖动（--no-cursor 对照实证过）。
+        // 自绘在发送前一刻查询 GetCursorInfo，时间差最小且保活帧可重画。
+        if let Err(e) = session.SetIsCursorCaptureEnabled(false) {
+            eprintln!("[capture] 关闭 WGC 光标合成失败（忽略）: {e}");
         }
         session
             .StartCapture()
@@ -373,6 +377,10 @@ where
         let mut last_push: Option<Instant> = None;
         // 静止保活用的上一帧缓存（BGRA）。只有成功送出一帧后才有值。
         let mut last_bgra: Option<Vec<u8>> = None;
+        // 自绘光标渲染器 + 合成缓冲（复用，避免每帧 8MB 分配）。
+        // 光标不在采集区域时不发生整帧拷贝，直接发干净帧。
+        let mut cursor_painter = CursorPainter::default();
+        let mut cursor_scratch: Vec<u8> = Vec::new();
         // 保活间隔：未限帧（target_fps=0）时 min_interval 为 0，
         // 若直接拿它当保活阈值会每 2ms 补一帧，故退回 ~30fps。
         let keepalive_interval = if target_fps > 0 {
@@ -424,7 +432,24 @@ where
                             stats.non_black_ratio = content.non_black_ratio;
                         }
                         last_push = Some(now);
-                        on_frame(&bgra)?;
+                        // 干净帧（无光标）缓存供保活重画；发送前一刻合成
+                        // 光标 → 光标位置与帧内容时间差最小（拖动不漂移）。
+                        let send: &[u8] = if include_cursor {
+                            match cursor_painter.render(
+                                &mut cursor_scratch,
+                                &bgra,
+                                width as usize,
+                                height as usize,
+                                bounds_x,
+                                bounds_y,
+                            ) {
+                                Some(p) => p,
+                                None => &bgra[..],
+                            }
+                        } else {
+                            &bgra[..]
+                        };
+                        on_frame(send)?;
                         last_bgra = Some(bgra);   // 缓存供静止保活重复送帧
                     }
                 }
@@ -435,9 +460,26 @@ where
                     // 在 0~30 之间大幅波动，还会反复触发低帧自愈造成周期性黑屏。
                     // 这里按目标帧率重复上一帧：编码器对相同帧只输出极小的 skip P 帧，
                     // 码率几乎不增，但接收端能维持恒定帧率与即时的交互回显。
+                    // 自绘光标在保活帧上**按当前位置重画**：画面静止时鼠标
+                    // 依然 30fps 流畅移动（WGC 系统合成做不到这一点）。
                     if let (Some(buf), Some(lp)) = (&last_bgra, last_push) {
                         if lp.elapsed() >= keepalive_interval {
-                            on_frame(buf)?;
+                            let send: &[u8] = if include_cursor {
+                                match cursor_painter.render(
+                                    &mut cursor_scratch,
+                                    buf,
+                                    width as usize,
+                                    height as usize,
+                                    bounds_x,
+                                    bounds_y,
+                                ) {
+                                    Some(p) => p,
+                                    None => &buf[..],
+                                }
+                            } else {
+                                &buf[..]
+                            };
+                            on_frame(send)?;
                             stats.keepalive_frames += 1;
                             last_push = Some(Instant::now());
                         }
