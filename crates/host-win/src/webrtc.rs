@@ -291,6 +291,11 @@ impl WebRtcHub {
             })
             .map_err(|e| format!("spawn 信令转发线程失败: {e}"))?;
 
+        // 会话线程退出后从 Hub 摘除自身句柄（2026-11-22 修复）：
+        // 否则该 id 留在 sessions map 里，客户端在同一 WS 上重连时
+        // join 的幂等检查会撞上已死 handle（信令投递进黑洞、永不重建），
+        // push_frame 也持续向已关通道 try_send。与 leave() 双方互斥 remove，幂等。
+        let sessions_map = self.sessions.clone();
         thread::Builder::new()
             .name(format!("webrtc-{id}"))
             .spawn(move || {
@@ -302,6 +307,7 @@ impl WebRtcHub {
                     Err(e) => {
                         let _ = sess_out_tx
                             .send(SignalOut::State(format!("tokio 运行时创建失败: {e}")));
+                        sessions_map.lock().unwrap().remove(&id);
                         return;
                     }
                 };
@@ -311,6 +317,7 @@ impl WebRtcHub {
                         let _ = sess_out_tx.send(SignalOut::State(format!("会话错误: {e}")));
                     }
                 });
+                sessions_map.lock().unwrap().remove(&id);
             })
             .map_err(|e| format!("spawn webrtc 会话线程失败: {e}"))?;
 
@@ -583,6 +590,9 @@ async fn run_once(
     let mut diag_ticker = tokio::time::interval(Duration::from_secs(3));
     // 本会话是否已接受过 answer（一个 pc 只能协商一次，多余 answer 忽略）
     let mut answered = false;
+    // 僵尸会话回收计时：首次观察到 conn=Failed 的时刻。
+    // 恢复到非 Failed 即清零；持续超过 10s 则关闭会话。
+    let mut failed_since: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -658,6 +668,31 @@ async fn run_once(
 
             // 5b. 节拍到点：取一帧发送（不排空）
             _ = ticker.tick() => {
+                // 僵尸会话回收（2026-11-22 修复）：ICE Failed 后本循环仍会继续
+                // write_sample，编码帧白白烧 CPU（4h 日志实证：一个会话在
+                // conn=Failed 后仍写入 38 万帧 ≈ 3.5 小时空转）。Failed 持续
+                // 10s 无恢复即关闭会话；Disconnected 是弱网暂态（客户端会自动
+                // 重连），不在此回收。connection_state() 为原子读，33ms 一拍无开销。
+                if pc.connection_state() == RTCPeerConnectionState::Failed {
+                    match failed_since {
+                        None => {
+                            failed_since = Some(std::time::Instant::now());
+                            let _ = signal_out_tx.send(SignalOut::State(
+                                "连接状态 Failed：10 秒内无恢复将回收会话".into(),
+                            ));
+                        }
+                        Some(t) if t.elapsed() >= Duration::from_secs(10) => {
+                            let _ = signal_out_tx.send(SignalOut::State(format!(
+                                "Failed 持续 10s，回收僵尸会话（累计写入 {sent} 帧）"
+                            )));
+                            let _ = pc.close().await;
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    failed_since = None;
+                }
                 // 每拍只取一帧，不排空队列：
                 // 排空会制造"0 帧/2 帧"的 micro-burst，节拍器看似 50ms 均匀，
                 // 实际取帧节奏在 0ms 和 100ms 之间跳，浏览器 jitterBuffer 因此
