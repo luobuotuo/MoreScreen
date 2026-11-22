@@ -39,6 +39,7 @@ use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -523,8 +524,23 @@ async fn run_once(
     // 这样做的好处：浏览器收到含候选的 offer 即可直连，不依赖 trickle。
     // 数据通道 `ctl`：承载输入回传、设备信息与网络质量上报。
     // 必须在这里创建（否则 ICE gathering 不会被触发，见下方注释）。
+    //
+    // **不可靠无序 + 500ms 生命期**（2026-11-22 弱网实测修复）：
+    // 默认 ordered+reliable 在丢包时产生队头阻塞——一条消息丢包重传期间，
+    // 后续所有消息（包括点击）全部排队，弱网 RTT 220ms 一次丢包即让输入
+    // 延迟秒级，表现为「弱网下点击不起作用」（宿主直点有效、通道送达晚）。
+    // 输入是「最新状态优先」型流量：
+    //   - unordered：不等待补齐顺序，先到先用（每条消息 JSON 自包含，乱序无影响）；
+    //   - maxPacketLifeTime=500ms：丢包有一次重传机会（220ms RTT 内完成），
+    //     持续拥塞时超时丢弃，保住后续新消息不被旧消息阻塞。
+    // stat（3 秒周期）/echo/sync（自带重试）对偶发丢弃天然免疫。
+    let dc_init = RTCDataChannelInit {
+        ordered: Some(false),
+        max_packet_life_time: Some(500),
+        ..Default::default()
+    };
     let ctl = pc
-        .create_data_channel("ctl", None)
+        .create_data_channel("ctl", Some(dc_init))
         .await
         .map_err(|e| format!("create_data_channel 失败: {e}"))?;
     {
